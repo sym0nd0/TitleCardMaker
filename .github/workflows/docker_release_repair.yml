@@ -196,11 +196,76 @@ jobs:
           candidate_file=$(mktemp)
           promotions_file=$(mktemp)
           decision_file=$(mktemp)
-          trap 'rm -f "$candidate_file" "$promotions_file" "$decision_file"' EXIT
+          bootstrap_file=$(mktemp)
+          trap 'rm -f "$candidate_file" "$promotions_file" "$decision_file" "$bootstrap_file"' EXIT
           promotion_candidates "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" "$tag" >"$candidate_file"
           mapfile -t candidate_tags <"$candidate_file"
           .github/scripts/docker-semver-tags.sh promotions "$tag" "${candidate_tags[@]}" >"$promotions_file"
-          # Check both existing alias targets before copying any alias.
+          # Explicit repair migration: preflight every stale alias before any
+          # alias write. Normal publication keeps its strict unmatched guard.
+          while IFS=$'\t' read -r record alias; do
+            [[ $record == promote ]] || continue
+            for repository in "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME"; do
+              alias_ref="${repository}:${alias}"
+              bootstrap_target=$(repair_alias_bootstrap_target "$alias_ref" "$tag" \
+                "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" "${candidate_tags[@]}")
+              if [[ -n $bootstrap_target ]]; then
+                printf '%s\t%s\n' "$alias_ref" "$bootstrap_target" >>"$bootstrap_file"
+              else
+                guard_alias_promotion "$alias_ref" "$tag" "$SOURCE_URL" "${candidate_tags[@]}"
+              fi
+            done
+          done <"$promotions_file"
+
+          latest_repair_required=false
+          if ! grep -Fqx $'promote\tlatest' "$promotions_file"; then
+            # A repair of an older tag also reconciles latest to the highest
+            # common validated exact tag.
+            common_tags=$(common_valid_exact_tags "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL")
+            highest_common=''
+            while IFS= read -r candidate; do
+              [[ -n $candidate ]] || continue
+              if [[ -z $highest_common ]]; then
+                highest_common=$candidate
+              else
+                comparison=$(.github/scripts/docker-semver-tags.sh compare "$candidate" "$highest_common")
+                [[ $comparison == 1 || $comparison == 0 || $comparison == -1 ]]
+                [[ $comparison != 1 ]] || highest_common=$candidate
+              fi
+            done <<<"$common_tags"
+            test -n "$highest_common"
+            for repository in "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME"; do
+              alias_ref="${repository}:latest"
+              bootstrap_target=$(repair_alias_bootstrap_target "$alias_ref" "$highest_common" \
+                "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" "${candidate_tags[@]}")
+              if [[ -n $bootstrap_target ]]; then
+                printf '%s\t%s\n' "$alias_ref" "$bootstrap_target" >>"$bootstrap_file"
+                latest_repair_required=true
+              else
+                known_latest=$(resolved_alias_target "$alias_ref" "$SOURCE_URL" "${candidate_tags[@]}")
+                if [[ $known_latest != "$highest_common" ]]; then
+                  # Missing aliases and older validated aliases can advance.
+                  # The normal guard still rejects any known newer target.
+                  guard_alias_promotion "$alias_ref" "$highest_common" "$SOURCE_URL" "${candidate_tags[@]}"
+                  printf '%s\t%s\n' "$alias_ref" "$highest_common" >>"$bootstrap_file"
+                  latest_repair_required=true
+                fi
+              fi
+            done
+          fi
+          if [[ $latest_repair_required == false ]]; then
+            latest_decision "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \
+              "$tag" "$promotions_file" "${candidate_tags[@]}" >"$decision_file"
+          fi
+
+          while IFS=$'\t' read -r alias_ref bootstrap_target; do
+            [[ -n $alias_ref ]] || continue
+            repository=${alias_ref%:*}
+            bootstrap_sha=$(validated_tag_source_sha "$bootstrap_target")
+            copy_alias_by_digest "${repository}:${bootstrap_target}" "$alias_ref"
+            verify_alias "$alias_ref" "${repository}:${bootstrap_target}" \
+              "$bootstrap_target" "$bootstrap_sha" "$SOURCE_URL"
+          done <"$bootstrap_file"
           while IFS=$'\t' read -r record alias; do
             [[ $record == promote ]] || continue
             guard_alias_promotion "${DOCKER_IMGNAME}:${alias}" "$tag" "$SOURCE_URL" "${candidate_tags[@]}"

@@ -369,7 +369,7 @@ resolved_alias_target() {
   done
   [[ -n $matched ]] || {
     registry_error "${alias_ref} does not match a validated stable exact release"
-    return 1
+    return 2
   }
   revision=$(validated_tag_source_sha "$matched") || return 1
   verify_release "${repository}:${matched}" "$matched" "$revision" "$expected_source" >/dev/null || return 1
@@ -416,6 +416,77 @@ guard_alias_promotion() {
     registry_error "${alias_ref} already points to newer validated release ${matched}"
     return 1
   }
+}
+
+# Repair only: an unmatched alias is an ordering floor, never release evidence.
+# The requested target must be an independently validated exact tag in both registries.
+repair_alias_bootstrap_target() {
+  (($# >= 6)) || return 64
+  local alias_ref=$1 target=$2 gh_repository=$3 docker_repository=$4 expected_source=$5
+  shift 5
+  local alias=${alias_ref##*:} major minor candidate found=false status
+  local repository index_json platform_digest config_json old_version old_revision target_revision comparison
+  [[ $target =~ $REGISTRY_STABLE_RE ]] || registry_error "invalid bootstrap target ${target}" || return 1
+  major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+  reject_quarantined_release "$target" || return 1
+  case $alias in
+    "v${major}.${minor}"|"v${major}"|latest) ;;
+    *) registry_error "${alias_ref} is not an alias of ${target}"; return 1 ;;
+  esac
+  for candidate in "$@"; do
+    [[ $candidate != "$target" ]] || found=true
+  done
+  [[ $found == true ]] || registry_error "${target} is missing from promotion candidates" || return 1
+
+  local gh_state docker_state
+  gh_state=$(registry_tag_state "${gh_repository}:${target}") || return 1
+  docker_state=$(registry_tag_state "${docker_repository}:${target}") || return 1
+  [[ $gh_state == present && $docker_state == present ]] || \
+    registry_error "${target} must be present in both registries before bootstrap" || return 1
+  target_revision=$(validated_tag_source_sha "$target") || return 1
+  verify_release "${gh_repository}:${target}" "$target" "$target_revision" "$expected_source" >/dev/null || return 1
+  verify_release "${docker_repository}:${target}" "$target" "$target_revision" "$expected_source" >/dev/null || return 1
+  compare_releases "${gh_repository}:${target}" "${docker_repository}:${target}" \
+    "$target" "$target_revision" "$expected_source" || return 1
+
+  if resolved_alias_target "$alias_ref" "$expected_source" "$@" >/dev/null; then
+    return 0 # Existing validated aliases still use guard_alias_promotion.
+  else
+    status=$?
+    [[ $status == 2 ]] || return "$status"
+  fi
+
+  # Read the current alias's claimed version only to forbid a backwards move.
+  # A missing Git tag, bad label, platform, or provenance stops migration.
+  repository=$(repository_from_ref "$alias_ref") || return 1
+  if ! index_json=$($REGCTL_BIN manifest get "$alias_ref" --format raw-body 2>&1); then
+    registry_error "could not read existing alias ${alias_ref}: ${index_json}"
+    return 1
+  fi
+  platform_digest=$(jq -er '
+    [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and
+      ((.platform.variant // "") == "")) | .digest] |
+    if length == 1 then .[0] else error("ambiguous amd64 platform") end |
+    select(type == "string" and startswith("sha256:"))
+  ' <<<"$index_json") || registry_error "could not identify the version of ${alias_ref}" || return 1
+  if ! config_json=$($REGCTL_BIN image config "${repository}@${platform_digest}" --format raw-body 2>&1); then
+    registry_error "could not read existing alias config ${alias_ref}: ${config_json}"
+    return 1
+  fi
+  old_version=$(jq -er '.config.Labels["org.opencontainers.image.version"] | select(type == "string")' \
+    <<<"$config_json") || registry_error "${alias_ref} has no usable version label" || return 1
+  [[ $old_version =~ $REGISTRY_STABLE_RE ]] || registry_error "${alias_ref} has invalid version ${old_version}" || return 1
+  reject_quarantined_release "$old_version" || return 1
+  case $alias in
+    "v${major}.${minor}") [[ $old_version =~ ^v${major}\.${minor}\.[0-9]+$ ]] ;;
+    "v${major}") [[ $old_version =~ ^v${major}\.[0-9]+\.[0-9]+$ ]] ;;
+    latest) true ;;
+  esac || registry_error "${alias_ref} points outside its release series" || return 1
+  old_revision=$(validated_tag_source_sha "$old_version") || return 1
+  verify_release "$alias_ref" "$old_version" "$old_revision" "$expected_source" >/dev/null || return 1
+  comparison=$("${BASH_SOURCE[0]%/*}/docker-semver-tags.sh" compare "$target" "$old_version") || return 1
+  [[ $comparison == 1 ]] || registry_error "${alias_ref} is not older than ${target}" || return 1
+  printf '%s\n' "$target"
 }
 
 validated_common_latest_target() {

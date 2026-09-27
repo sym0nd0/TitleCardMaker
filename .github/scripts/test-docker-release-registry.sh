@@ -293,7 +293,7 @@ if [[ ${FAKE_MULTI_RELEASE:-0} == 1 ]]; then
       printf '%s\n' "$tag"
     fi
     exit 0
-  done < <(jq -r '.tags[]' <<<"$GH_TAGS"; jq -r '.tags[]' <<<"$DH_TAGS")
+  done < <(jq -r '.tags[]' <<<"$GH_TAGS"; jq -r '.tags[]' <<<"$DH_TAGS"; jq -r '.[]' <<<"${ALIAS_SOURCE_TAGS:-[]}")
   exit 1
 fi
 [[ $1 == "$SOURCE_SHA" ]] || {
@@ -583,5 +583,50 @@ mapfile -t promotion_tags < <(promotion_candidates "$GH_REPO" "$DH_REPO" "$SOURC
 "$SCRIPT_DIR/docker-semver-tags.sh" promotions v2.16.11 "${promotion_tags[@]}" >"$TEST_DIR/promotions"
 assert_eq "$(latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.11 "$TEST_DIR/promotions" "${promotion_tags[@]}")" \
   $'latest_eligible\ttrue\nexpected_latest_tag\tv2.16.11'
+
+# Repair may replace a stale alias only after establishing its old version as
+# an ordering floor and independently validating the new exact tag in both registries.
+export GH_TAGS='{"tags":["v2.16.10"]}' DH_TAGS='{"tags":["v2.16.10"]}'
+export GH_ALIASES='{"v2.16":"v2.16.9","latest":"v2.16.9"}'
+export DH_ALIASES=$GH_ALIASES ALIAS_SOURCE_TAGS='["v2.16.9"]'
+: >"$WRITE_LOG"
+assert_eq "$(repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10)" v2.16.10
+assert_eq "$(repair_alias_bootstrap_target "$DH_REPO:latest" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10)" v2.16.10
+[[ ! -s $WRITE_LOG ]] || fail 'bootstrap preflight wrote an alias'
+copy_alias_by_digest "$GH_REPO:v2.16.10" "$GH_REPO:v2.16"
+grep -F " -> $GH_REPO:v2.16" "$WRITE_LOG" >/dev/null || fail 'repair bootstrap did not copy the validated exact digest'
+: >"$WRITE_LOG"
+if guard_alias_promotion "$GH_REPO:v2.16" v2.16.10 "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'normal publication accepted an unmatched stale alias'
+fi
+
+export DH_TAGS='{"tags":[]}'
+if repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'bootstrap accepted a target missing from Docker Hub'
+fi
+[[ ! -s $WRITE_LOG ]] || fail 'missing bootstrap target caused a write'
+export DH_TAGS='{"tags":["v2.16.10"]}'
+export GH_TAGS='{"tags":[]}'
+if repair_alias_bootstrap_target "$DH_REPO:latest" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'bootstrap accepted a target missing from GHCR'
+fi
+export GH_TAGS='{"tags":["v2.16.10"]}'
+if FAKE_MODE=wrong_revision repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'bootstrap accepted invalid target provenance'
+fi
+
+export GH_ALIASES='{"v2.16":"v2.16.11"}' ALIAS_SOURCE_TAGS='["v2.16.11"]'
+if repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'bootstrap moved an unmatched alias backwards'
+fi
+export GH_ALIASES='{"v2.16":"v9.9.9"}' ALIAS_SOURCE_TAGS='[]'
+if repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'bootstrap accepted an unverifiable alias version'
+fi
+export GH_ALIASES='{"v2.16":"v2.16.1"}' ALIAS_SOURCE_TAGS='["v2.16.1"]'
+if repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10 >/dev/null 2>&1; then
+  fail 'bootstrap accepted the quarantined v2.16.1 alias'
+fi
+[[ ! -s $WRITE_LOG ]] || fail 'failed bootstrap preflight caused a write'
 
 printf 'All Docker release registry helper tests passed.\n'
