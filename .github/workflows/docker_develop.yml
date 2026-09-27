@@ -2,17 +2,21 @@ name: Docker Develop Release
 
 on:
   workflow_dispatch:
-  # push:
-  #   branches:
-  #     - develop
-  #     - web-ui
+
+permissions:
+  contents: read
+
+concurrency:
+  group: titlecardmaker-docker-develop
+  cancel-in-progress: true
 
 jobs:
   docker-develop:
     uses: ./.github/workflows/docker_build.yml
     with:
       tag: develop
-      is_develop: true
+      source_sha: ${{ github.sha }}
+      channel: develop
     secrets:
       CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
       DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}

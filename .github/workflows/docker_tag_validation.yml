@@ -1,0 +1,158 @@
+name: Validate Docker release automation
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/docker-*.sh'
+      - '.github/scripts/test-docker-*.sh'
+      - '.github/scripts/github-release.sh'
+      - '.github/scripts/test-github-release.sh'
+      - '.github/workflows/docker_*.yml'
+      - '.github/workflows/docker_*.yaml'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/scripts/docker-*.sh'
+      - '.github/scripts/test-docker-*.sh'
+      - '.github/scripts/github-release.sh'
+      - '.github/scripts/test-github-release.sh'
+      - '.github/workflows/docker_*.yml'
+      - '.github/workflows/docker_*.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run helper and mock tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/scripts/test-docker-semver-tags.sh
+          .github/scripts/test-docker-release-registry.sh
+          .github/scripts/test-github-release.sh
+
+      - name: Check Bash syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in .github/scripts/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Install fixed validation tools
+        shell: bash
+        env:
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/docker-release-validation-tools"
+          mkdir -p "$tools_dir"
+          curl -fsSLo "$tools_dir/shellcheck.tar.xz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  ${tools_dir}/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf "$tools_dir/shellcheck.tar.xz" -C "$tools_dir"
+          ln -s "$tools_dir/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$tools_dir/shellcheck"
+          curl -fsSLo "$tools_dir/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${tools_dir}/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$tools_dir/actionlint.tar.gz" -C "$tools_dir" actionlint
+          echo "$tools_dir" >>"$GITHUB_PATH"
+
+      - name: Run ShellCheck
+        shell: bash
+        run: shellcheck .github/scripts/*.sh
+
+      - name: Run actionlint
+        shell: bash
+        run: |
+          # actionlint 1.7.12 predates GitHub's documented concurrency.queue
+          # schema, so ignore only that exact schema-lag diagnostic.
+          actionlint -shellcheck shellcheck \
+            -ignore '^unexpected key "queue" for "concurrency" section' \
+            .github/workflows/docker_build.yml \
+            .github/workflows/docker_develop.yml \
+            .github/workflows/docker_main.yaml \
+            .github/workflows/docker_release.yml \
+            .github/workflows/docker_release_repair.yml \
+            .github/workflows/docker_tag_validation.yml
+
+      - name: Assert release workflow security policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          stable=.github/workflows/docker_release.yml
+          build=.github/workflows/docker_build.yml
+          main=.github/workflows/docker_main.yaml
+          develop=.github/workflows/docker_develop.yml
+          repair=.github/workflows/docker_release_repair.yml
+          release_helper=.github/scripts/github-release.sh
+
+          assert_absent() {
+            local pattern=$1 file=$2
+            if grep -Eq -- "$pattern" "$file"; then
+              echo "Forbidden pattern '${pattern}' found in ${file}" >&2
+              return 1
+            fi
+          }
+
+          assert_absent 'workflow_dispatch' "$stable"
+          assert_absent 'latest' "$main"
+          assert_absent 'latest|v[0-9]' "$develop"
+          for publisher in "$stable" "$build" "$main" "$develop" "$repair"; do
+            assert_absent 'pull_request(_target)?:' "$publisher"
+          done
+          for caller in "$stable" "$main" "$develop"; do
+            grep -q 'source_sha:' "$caller"
+            grep -q 'channel:' "$caller"
+          done
+
+          preflight_line=$(grep -n 'name: Exact-tag immutability preflight' "$build" | cut -d: -f1)
+          inventory_line=$(grep -n 'name: Validate existing stable release inventory' "$build" | cut -d: -f1)
+          first_write_line=$(grep -n 'name: Push architecture images' "$build" | cut -d: -f1)
+          validate_source_line=$(grep -n 'name: Validate source and publication mode' "$build" | cut -d: -f1)
+          test "$validate_source_line" -lt "$preflight_line"
+          test "$preflight_line" -lt "$inventory_line"
+          test "$inventory_line" -lt "$first_write_line"
+          grep -Fq 'needs: [validate-inputs, build, test]' "$build"
+          grep -Fq 'docker-semver-tags.sh derive' "$build"
+          grep -Fq 'inputs.tag }}^{commit}' "$build"
+          grep -Fq 'backend/.version' "$build"
+          assert_absent 'docker[[:space:]]+build|buildx|docker_build\.yml' "$repair"
+          assert_absent "'\$\{\{ inputs\.tag \}\}'" "$repair"
+          grep -q 'needs: \[trusted-invocation, verify-release-source\]' "$repair"
+          grep -q 'reject_quarantined_release' "$stable"
+          grep -q 'reject_quarantined_release' "$repair"
+          for publisher in "$build" "$repair"; do
+            grep -q 'promotion_candidates' "$publisher"
+            exact_copy_line=$(grep -n 'copy_exact_by_digest' "$publisher" | head -n 1 | cut -d: -f1)
+            promotion_line=$(grep -n 'promotion_candidates' "$publisher" | head -n 1 | cut -d: -f1)
+            guard_line=$(grep -n 'guard_alias_promotion' "$publisher" | head -n 1 | cut -d: -f1)
+            decision_line=$(grep -n 'latest_decision' "$publisher" | head -n 1 | cut -d: -f1)
+            alias_write_line=$(grep -n 'copy_alias_by_digest' "$publisher" | head -n 1 | cut -d: -f1)
+            test "$exact_copy_line" -lt "$promotion_line"
+            test "$promotion_line" -lt "$alias_write_line"
+            test "$guard_line" -lt "$alias_write_line"
+            test "$decision_line" -lt "$alias_write_line"
+            grep -q 'validated_common_latest_target' "$publisher"
+          done
+          repair_inventory_line=$(grep -n 'validated_release_inventory' "$repair" | head -n 1 | cut -d: -f1)
+          repair_first_copy_line=$(grep -n 'copy_exact_by_digest' "$repair" | head -n 1 | cut -d: -f1)
+          test "$repair_inventory_line" -lt "$repair_first_copy_line"
+          [[ $(grep -Fxc "      - '.github/scripts/test-docker-*.sh'" .github/workflows/docker_tag_validation.yml) -eq 2 ]]
+          grep -q -- '--verify-tag' "$release_helper"
+          grep -q -- '--latest=false' "$release_helper"
+          grep -q -- '--latest$' "$release_helper"
+          assert_absent '--target' "$release_helper"
+          grep -Eq "printf .*make_latest.*%s" "$release_helper"
+          assert_absent 'github.token' "$stable"
+          assert_absent 'GITHUB_TOKEN' "$release_helper"
