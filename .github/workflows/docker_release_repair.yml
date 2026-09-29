@@ -249,8 +249,9 @@ jobs:
             done
           fi
           if [[ $latest_repair_required == false ]]; then
+            # Fail closed before bootstrap copies. The later call recomputes the output.
             latest_decision "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \
-              "$tag" "$promotions_file" "${candidate_tags[@]}" >"$decision_file"
+              "$tag" "$promotions_file" "${candidate_tags[@]}" >/dev/null
           fi
 
           while IFS=$'\t' read -r alias_ref bootstrap_target; do

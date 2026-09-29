@@ -151,9 +151,13 @@ jobs:
           repair_source_preflight_line=$(grep -n 'repair_exact_source_preflight' "$repair" | head -n 1 | cut -d: -f1)
           repair_inventory_line=$(grep -n 'validated_release_inventory' "$repair" | head -n 1 | cut -d: -f1)
           repair_first_copy_line=$(grep -n 'copy_exact_by_digest' "$repair" | head -n 1 | cut -d: -f1)
+          first_latest_decision_line=$(grep -nF "latest_decision \"\$DOCKER_IMGNAME\"" "$repair" | head -n 1 | cut -d: -f1)
+          first_latest_decision_output=$(sed -n "$((first_latest_decision_line + 1))p" "$repair")
           test "$repair_source_preflight_line" -lt "$repair_inventory_line"
           test "$repair_inventory_line" -lt "$repair_first_copy_line"
           assert_absent 'copy_exact_by_digest.*docker_exact.*gh_exact' "$repair"
+          test "$first_latest_decision_line" -lt "$repair_first_copy_line"
+          grep -Fq '>/dev/null' <<<"$first_latest_decision_output"
           [[ $(grep -Fxc "      - '.github/scripts/test-docker-*.sh'" .github/workflows/docker_tag_validation.yml) -eq 2 ]]
           grep -q -- '--verify-tag' "$release_helper"
           grep -q -- '--latest=false' "$release_helper"

@@ -12,13 +12,13 @@ workflow=$1
   exit 1
 }
 
-tag_reference_re='inputs[[:space:]]*\.[[:space:]]*tag'
+input_reference_re='\$\{\{[^}]*inputs[^}]*\}\}'
 safe_assignment_re='^ {10}RELEASE_TAG:[[:space:]]+\$\{\{[[:space:]]*inputs[[:space:]]*\.[[:space:]]*tag[[:space:]]*\}\}[[:space:]]*$'
 env_line_re='^ {8}env:[[:space:]]*$'
-mapfile -t tag_reference_lines < <(grep -nE "$tag_reference_re" "$workflow" || true)
+mapfile -t tag_reference_lines < <(grep -nE "$input_reference_re" "$workflow" || true)
 
 if ((${#tag_reference_lines[@]} != 4)); then
-  printf 'Expected four inputs.tag references, found %s in %s\n' \
+  printf 'Expected four workflow input references, found %s in %s\n' \
     "${#tag_reference_lines[@]}" "$workflow" >&2
   exit 1
 fi
@@ -27,7 +27,7 @@ for match in "${tag_reference_lines[@]}"; do
   line_number=${match%%:*}
   line=${match#*:}
   if [[ ! $line =~ $safe_assignment_re ]]; then
-    printf 'inputs.tag is only allowed as an unquoted RELEASE_TAG environment assignment (%s:%s)\n' \
+    printf 'Workflow input references are only allowed as an unquoted RELEASE_TAG environment assignment (%s:%s)\n' \
       "$workflow" "$line_number" >&2
       exit 1
   fi

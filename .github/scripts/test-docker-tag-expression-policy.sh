@@ -70,4 +70,25 @@ if "$POLICY" "$RUN_BLOCK" >"$TEST_DIR/run-block.out" 2>&1; then
   fail 'tag expression policy accepted inputs.tag in a run block'
 fi
 
+# GitHub expressions also allow index syntax and the dispatch event payload.
+# These must be rejected outside the single environment assignment too.
+alternate_references=(
+  "inputs['tag']"
+  'inputs["tag"]'
+  'github.event.inputs.tag'
+  'github.event.inputs["tag"]'
+  "github['event']['inputs']['tag']"
+)
+for index in "${!alternate_references[@]}"; do
+  ALTERNATE="$TEST_DIR/alternate-${index}.yml"
+  cp "$VALID" "$ALTERNATE"
+  printf '%s\n' \
+    '      - name: Alternate tag reference' \
+    '        run: |' \
+    "          echo '\${{ ${alternate_references[$index]} }}'" >>"$ALTERNATE"
+  if "$POLICY" "$ALTERNATE" >"$TEST_DIR/alternate-${index}.out" 2>&1; then
+    fail "tag expression policy accepted alternate reference ${alternate_references[$index]}"
+  fi
+done
+
 printf 'All Docker tag expression policy tests passed.\n'
