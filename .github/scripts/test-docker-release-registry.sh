@@ -229,6 +229,29 @@ for states in 'present absent' 'absent present' 'present present'; do
   [[ ! -s $WRITE_LOG ]] || fail "failed preflight performed a write for ${states}"
 done
 
+# Docker Hub labels are mutable image metadata, not independent provenance.
+# Even a Hub-only exact tag with labels that match the requested Git tag must
+# never be copied into the canonical GHCR repository.
+export GH_STATE=absent DH_STATE=present FAKE_MODE=valid
+verify_release "$DH_REF" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+: >"$WRITE_LOG"
+if repair_exact_source_preflight "$GH_STATE" "$DH_STATE" 2>"$TEST_DIR/repair-source-error"; then
+  fail 'repair source preflight accepted a DockerHub-only exact release'
+fi
+grep -F 'refusing to promote a DockerHub-only exact release into GHCR without trusted provenance' \
+  "$TEST_DIR/repair-source-error" >/dev/null || \
+  fail 'DockerHub-only repair did not explain the missing trusted provenance'
+[[ ! -s $WRITE_LOG ]] || fail 'DockerHub-only repair source preflight performed a write'
+
+repair_exact_source_preflight present absent || fail 'repair rejected canonical GHCR-only recovery'
+repair_exact_source_preflight present present || fail 'repair rejected an already mirrored exact release'
+for states in 'absent absent' 'auth absent' 'present timeout'; do
+  read -r GH_STATE DH_STATE <<<"$states"
+  if repair_exact_source_preflight "$GH_STATE" "$DH_STATE" >/dev/null 2>&1; then
+    fail "repair source preflight accepted unsafe states ${states}"
+  fi
+done
+
 GH_STATE=auth DH_STATE=absent
 if stable_exact_preflight "$GH_REF" "$DH_REF" >/dev/null 2>&1; then
   fail 'preflight treated authentication failure as absence'

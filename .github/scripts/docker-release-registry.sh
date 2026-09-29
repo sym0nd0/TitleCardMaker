@@ -67,6 +67,32 @@ stable_exact_preflight() {
   return 1
 }
 
+# Repair may mirror the canonical GHCR release to Docker Hub, but registry
+# labels and matching layer fingerprints do not prove that a Docker Hub-only
+# image came from the tagged Git source. Refuse that direction unless a future
+# repair path can verify independent provenance.
+repair_exact_source_preflight() {
+  (($# == 2)) || return 64
+  local gh_state=$1 docker_state=$2
+  case "${gh_state}/${docker_state}" in
+    present/absent|present/present)
+      return 0
+      ;;
+    absent/present)
+      registry_error 'refusing to promote a DockerHub-only exact release into GHCR without trusted provenance'
+      return 1
+      ;;
+    absent/absent)
+      registry_error 'neither registry contains an exact release to repair; repair never builds'
+      return 1
+      ;;
+    *)
+      registry_error "unsafe exact-release repair state: GHCR=${gh_state} DockerHub=${docker_state}"
+      return 1
+      ;;
+  esac
+}
+
 repository_from_ref() {
   local ref=${1%@*}
   local last=${ref##*/}

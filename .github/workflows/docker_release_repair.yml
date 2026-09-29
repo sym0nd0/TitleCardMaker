@@ -56,6 +56,7 @@ jobs:
       - name: Checkout trusted automation
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ needs.trusted-invocation.outputs.trusted_sha }}
           fetch-depth: 0
           path: automation
@@ -64,6 +65,7 @@ jobs:
         id: release
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          TRUSTED_SHA: ${{ needs.trusted-invocation.outputs.trusted_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -71,7 +73,7 @@ jobs:
           automation/.github/scripts/docker-semver-tags.sh derive "$tag" >/dev/null
           source automation/.github/scripts/docker-release-registry.sh
           reject_quarantined_release "$tag"
-          test "$(git -C automation rev-parse HEAD)" = '${{ needs.trusted-invocation.outputs.trusted_sha }}'
+          test "$(git -C automation rev-parse HEAD)" = "$TRUSTED_SHA"
           source_sha=$(git -C automation rev-parse "${tag}^{commit}")
           remote_refs=$(git -C automation ls-remote --exit-code origin \
             "refs/tags/${tag}" "refs/tags/${tag}^{}")
@@ -84,22 +86,24 @@ jobs:
       - name: Checkout historical release source separately
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ steps.release.outputs.source_sha }}
           path: release-source
 
       - name: Verify release checkout and version
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C release-source rev-parse HEAD)" = '${{ steps.release.outputs.source_sha }}'
+          test "$(git -C release-source rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(tr -d '[:space:]' < release-source/backend/.version)" = "$RELEASE_TAG"
           remote_refs=$(git -C automation ls-remote --exit-code origin \
             "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")
           remote_sha=$(awk -v peeled="refs/tags/${RELEASE_TAG}^{}" -v direct="refs/tags/${RELEASE_TAG}" \
             '$2 == peeled {p=$1} $2 == direct {d=$1} END {print (p != "" ? p : d)}' <<<"$remote_refs")
-          test "$remote_sha" = '${{ steps.release.outputs.source_sha }}'
+          test "$remote_sha" = "$SOURCE_SHA"
 
   repair-registry:
     needs: [trusted-invocation, verify-release-source]
@@ -115,13 +119,16 @@ jobs:
       - name: Checkout trusted automation
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ needs.trusted-invocation.outputs.trusted_sha }}
           fetch-depth: 0
           path: automation
 
       - name: Verify trusted automation checkout
+        env:
+          TRUSTED_SHA: ${{ needs.trusted-invocation.outputs.trusted_sha }}
         shell: bash
-        run: test "$(git -C automation rev-parse HEAD)" = '${{ needs.trusted-invocation.outputs.trusted_sha }}'
+        run: test "$(git -C automation rev-parse HEAD)" = "$TRUSTED_SHA"
 
       - name: Install regctl
         uses: iarekylew00t/regctl-installer@61b6298c354562a692195ea71441e58508e667b0
@@ -144,29 +151,18 @@ jobs:
         working-directory: automation
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ needs.verify-release-source.outputs.source_sha }}
         shell: bash
         run: |
           set -euo pipefail
           source .github/scripts/docker-release-registry.sh
           tag=$RELEASE_TAG
-          source_sha='${{ needs.verify-release-source.outputs.source_sha }}'
+          source_sha=$SOURCE_SHA
           gh_exact="${DOCKER_IMGNAME}:${tag}"
           docker_exact="${DOCKER_HUB_IMGNAME}:${tag}"
           gh_state=$(registry_tag_state "$gh_exact")
           docker_state=$(registry_tag_state "$docker_exact")
-
-          case "${gh_state}/${docker_state}" in
-            absent/absent)
-              echo 'Neither registry contains the immutable exact release; repair never builds.' >&2
-              exit 1
-              ;;
-            present/absent|absent/present|present/present)
-              ;;
-            *)
-              echo "Unsafe registry state: GHCR=${gh_state} DockerHub=${docker_state}" >&2
-              exit 1
-              ;;
-          esac
+          repair_exact_source_preflight "$gh_state" "$docker_state"
 
           # Validate the pending repair source independently before scanning
           # history; this exact image is not necessarily present in both yet.
@@ -185,7 +181,6 @@ jobs:
 
           case "${gh_state}/${docker_state}" in
             present/absent) copy_exact_by_digest "$gh_exact" "$docker_exact" ;;
-            absent/present) copy_exact_by_digest "$docker_exact" "$gh_exact" ;;
             present/present) ;;
           esac
 
@@ -306,19 +301,24 @@ jobs:
       - name: Checkout trusted automation
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ needs.trusted-invocation.outputs.trusted_sha }}
 
       - name: Reconcile GitHub Release and explicit Latest state
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
+          TRUSTED_SHA: ${{ needs.trusted-invocation.outputs.trusted_sha }}
+          SOURCE_SHA: ${{ needs.verify-release-source.outputs.source_sha }}
+          LATEST_ELIGIBLE: ${{ needs.repair-registry.outputs.latest_eligible }}
+          EXPECTED_LATEST_TAG: ${{ needs.repair-registry.outputs.expected_latest_tag }}
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = '${{ needs.trusted-invocation.outputs.trusted_sha }}'
+          test "$(git rev-parse HEAD)" = "$TRUSTED_SHA"
           .github/scripts/github-release.sh reconcile \
             "$GITHUB_REPOSITORY" \
             "$RELEASE_TAG" \
-            '${{ needs.verify-release-source.outputs.source_sha }}' \
-            '${{ needs.repair-registry.outputs.latest_eligible }}' \
-            '${{ needs.repair-registry.outputs.expected_latest_tag }}'
+            "$SOURCE_SHA" \
+            "$LATEST_ELIGIBLE" \
+            "$EXPECTED_LATEST_TAG"

@@ -42,28 +42,33 @@ jobs:
       - name: Checkout immutable source
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
 
       - name: Validate source and publication mode
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PUBLICATION_CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ inputs.source_sha }}"
-          case "${{ inputs.channel }}" in
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          case "$PUBLICATION_CHANNEL" in
             stable)
-              .github/scripts/docker-semver-tags.sh derive "${{ inputs.tag }}" >/dev/null
-              test "$(git rev-parse "${{ inputs.tag }}^{commit}")" = "${{ inputs.source_sha }}"
-              test "$(tr -d '[:space:]' < backend/.version)" = "${{ inputs.tag }}"
+              .github/scripts/docker-semver-tags.sh derive "$RELEASE_TAG" >/dev/null
+              test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$SOURCE_SHA"
+              test "$(tr -d '[:space:]' < backend/.version)" = "$RELEASE_TAG"
               ;;
             main)
-              test "${{ inputs.tag }}" = main
+              test "$RELEASE_TAG" = main
               ;;
             develop)
-              test "${{ inputs.tag }}" = develop
+              test "$RELEASE_TAG" = develop
               ;;
             *)
-              echo "Unsupported publication channel: ${{ inputs.channel }}" >&2
+              echo "Unsupported publication channel: ${PUBLICATION_CHANNEL}" >&2
               exit 1
               ;;
           esac
@@ -80,16 +85,23 @@ jobs:
     steps:
       - name: Set architecture image name
         shell: bash
-        run: echo "IMAGE_NAME=$(cut -b 7- <<< '${{ matrix.arch }}' | tr -d '/')" >>"$GITHUB_ENV"
+        env:
+          ARCHITECTURE: ${{ matrix.arch }}
+        run: |
+          image_name=$(cut -b 7- <<< "$ARCHITECTURE" | tr -d '/')
+          echo "IMAGE_NAME=${image_name}" >>"$GITHUB_ENV"
 
       - name: Checkout immutable source
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
       - name: Verify checkout SHA
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "${{ inputs.source_sha }}"
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Set up QEMU for ARM emulation
         uses: docker/setup-qemu-action@v3
@@ -164,12 +176,15 @@ jobs:
       - name: Checkout immutable source
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ inputs.source_sha }}
 
       - name: Verify checkout SHA
         working-directory: .
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "${{ inputs.source_sha }}"
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Install Node
         uses: actions/setup-node@v7
@@ -195,11 +210,13 @@ jobs:
         run: docker load --input /tmp/amd64.tar
 
       - name: Launch container
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           mkdir config
           docker run -itd -p 4242:4242 -e TCM_TESTING=TRUE \
             -v "./config:/config" \
-            "${{ env.DOCKER_IMGNAME }}:${{ inputs.tag }}-amd64"
+            "$DOCKER_IMGNAME:${RELEASE_TAG}-amd64"
 
       - name: Start virtual display
         run: Xvfb :99 -screen 0 1920x1080x24 &
@@ -238,16 +255,19 @@ jobs:
     env:
       DOCKER_HUB_IMGNAME: ${{ secrets.DOCKER_HUB_USERNAME }}/titlecardmaker
       SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
     steps:
       - name: Checkout immutable source and trusted helpers
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
 
       - name: Verify checkout SHA
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "${{ inputs.source_sha }}"
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Download images
         uses: actions/download-artifact@v8
@@ -300,8 +320,8 @@ jobs:
           set -euo pipefail
           source .github/scripts/docker-release-registry.sh
           stable_exact_preflight \
-            "${DOCKER_IMGNAME}:${{ inputs.tag }}" \
-            "${DOCKER_HUB_IMGNAME}:${{ inputs.tag }}"
+            "${DOCKER_IMGNAME}:${RELEASE_TAG}" \
+            "${DOCKER_HUB_IMGNAME}:${RELEASE_TAG}"
 
       - name: Validate existing stable release inventory
         if: ${{ inputs.channel == 'stable' }}
@@ -317,14 +337,14 @@ jobs:
           set -euo pipefail
           # These are staging references for the immutable multi-platform exact
           # tag. The exact-tag preflight above is the release authority.
-          docker push "${DOCKER_IMGNAME}:${{ inputs.tag }}-amd64"
-          docker push "${DOCKER_IMGNAME}:${{ inputs.tag }}-arm64"
+          docker push "${DOCKER_IMGNAME}:${RELEASE_TAG}-amd64"
+          docker push "${DOCKER_IMGNAME}:${RELEASE_TAG}-arm64"
 
       - name: Publish exact GHCR multi-platform image
         shell: bash
         run: |
           set -euo pipefail
-          exact="${DOCKER_IMGNAME}:${{ inputs.tag }}"
+          exact="${DOCKER_IMGNAME}:${RELEASE_TAG}"
           docker manifest create "$exact" "${exact}-amd64" "${exact}-arm64"
           docker manifest push "$exact"
 
@@ -334,12 +354,12 @@ jobs:
         run: |
           set -euo pipefail
           source .github/scripts/docker-release-registry.sh
-          gh_exact="${DOCKER_IMGNAME}:${{ inputs.tag }}"
-          docker_exact="${DOCKER_HUB_IMGNAME}:${{ inputs.tag }}"
-          verify_release "$gh_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL" >/dev/null
+          gh_exact="${DOCKER_IMGNAME}:${RELEASE_TAG}"
+          docker_exact="${DOCKER_HUB_IMGNAME}:${RELEASE_TAG}"
+          verify_release "$gh_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
           copy_exact_by_digest "$gh_exact" "$docker_exact"
-          verify_release "$docker_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL" >/dev/null
-          compare_releases "$gh_exact" "$docker_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL"
+          verify_release "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          compare_releases "$gh_exact" "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
 
       - name: Publish and verify stable release and eligible aliases
         id: stable-publication
@@ -348,32 +368,32 @@ jobs:
         run: |
           set -euo pipefail
           source .github/scripts/docker-release-registry.sh
-          gh_exact="${DOCKER_IMGNAME}:${{ inputs.tag }}"
-          docker_exact="${DOCKER_HUB_IMGNAME}:${{ inputs.tag }}"
-          verify_release "$gh_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL" >/dev/null
+          gh_exact="${DOCKER_IMGNAME}:${RELEASE_TAG}"
+          docker_exact="${DOCKER_HUB_IMGNAME}:${RELEASE_TAG}"
+          verify_release "$gh_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
           copy_exact_by_digest "$gh_exact" "$docker_exact"
-          verify_release "$docker_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL" >/dev/null
-          compare_releases "$gh_exact" "$docker_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL"
+          verify_release "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          compare_releases "$gh_exact" "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
 
           candidate_file=$(mktemp)
           promotions_file=$(mktemp)
           decision_file=$(mktemp)
           trap 'rm -f "$candidate_file" "$promotions_file" "$decision_file"' EXIT
           promotion_candidates "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \
-            "${{ inputs.tag }}" >"$candidate_file"
+            "$RELEASE_TAG" >"$candidate_file"
           mapfile -t candidate_tags <"$candidate_file"
           .github/scripts/docker-semver-tags.sh promotions \
-            "${{ inputs.tag }}" "${candidate_tags[@]}" >"$promotions_file"
+            "$RELEASE_TAG" "${candidate_tags[@]}" >"$promotions_file"
           # Check both existing alias targets before copying any alias.
           while IFS=$'\t' read -r record alias; do
             [[ $record == promote ]] || continue
             guard_alias_promotion "${DOCKER_IMGNAME}:${alias}" \
-              "${{ inputs.tag }}" "$SOURCE_URL" "${candidate_tags[@]}"
+              "$RELEASE_TAG" "$SOURCE_URL" "${candidate_tags[@]}"
             guard_alias_promotion "${DOCKER_HUB_IMGNAME}:${alias}" \
-              "${{ inputs.tag }}" "$SOURCE_URL" "${candidate_tags[@]}"
+              "$RELEASE_TAG" "$SOURCE_URL" "${candidate_tags[@]}"
           done <"$promotions_file"
           latest_decision "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \
-            "${{ inputs.tag }}" "$promotions_file" "${candidate_tags[@]}" >"$decision_file"
+            "$RELEASE_TAG" "$promotions_file" "${candidate_tags[@]}" >"$decision_file"
           latest_eligible=$(awk -F '\t' '$1 == "latest_eligible" {print $2}' "$decision_file")
           expected_latest_tag=$(awk -F '\t' '$1 == "expected_latest_tag" {print $2}' "$decision_file")
           [[ $latest_eligible == true || $latest_eligible == false ]]
@@ -383,16 +403,16 @@ jobs:
             copy_alias_by_digest "$gh_exact" "${DOCKER_IMGNAME}:${alias}"
             copy_alias_by_digest "$docker_exact" "${DOCKER_HUB_IMGNAME}:${alias}"
             verify_alias "${DOCKER_IMGNAME}:${alias}" "$gh_exact" \
-              "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL"
+              "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
             verify_alias "${DOCKER_HUB_IMGNAME}:${alias}" "$docker_exact" \
-              "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL"
+              "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
           done <"$promotions_file"
           actual_latest_tag=$(validated_common_latest_target \
             "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" "${candidate_tags[@]}")
           test "$actual_latest_tag" = "$expected_latest_tag"
-          verify_release "$gh_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL" >/dev/null
-          verify_release "$docker_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL" >/dev/null
-          compare_releases "$gh_exact" "$docker_exact" "${{ inputs.tag }}" "${{ inputs.source_sha }}" "$SOURCE_URL"
+          verify_release "$gh_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          verify_release "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          compare_releases "$gh_exact" "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
           echo "latest_eligible=${latest_eligible}" >>"$GITHUB_OUTPUT"
           echo "expected_latest_tag=${expected_latest_tag}" >>"$GITHUB_OUTPUT"
 

@@ -22,6 +22,7 @@ jobs:
       - name: Checkout pushed tag commit
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ github.sha }}
           fetch-depth: 0
 
@@ -64,18 +65,23 @@ jobs:
       - name: Checkout immutable release source
         uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: ${{ needs.verify-source.outputs.source_sha }}
 
       - name: Reconcile GitHub Release and explicit Latest state
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
+          SOURCE_SHA: ${{ needs.verify-source.outputs.source_sha }}
+          LATEST_ELIGIBLE: ${{ needs.docker-release.outputs.latest_eligible }}
+          EXPECTED_LATEST_TAG: ${{ needs.docker-release.outputs.expected_latest_tag }}
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "${{ needs.verify-source.outputs.source_sha }}"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           .github/scripts/github-release.sh reconcile \
             "$GITHUB_REPOSITORY" \
-            "${{ needs.verify-source.outputs.tag }}" \
-            "${{ needs.verify-source.outputs.source_sha }}" \
-            "${{ needs.docker-release.outputs.latest_eligible }}" \
-            "${{ needs.docker-release.outputs.expected_latest_tag }}"
+            "$RELEASE_TAG" \
+            "$SOURCE_SHA" \
+            "$LATEST_ELIGIBLE" \
+            "$EXPECTED_LATEST_TAG"

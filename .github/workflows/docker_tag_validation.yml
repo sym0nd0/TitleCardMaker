@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Run helper and mock tests
         shell: bash
@@ -36,6 +38,7 @@ jobs:
           set -euo pipefail
           .github/scripts/test-docker-semver-tags.sh
           .github/scripts/test-docker-release-registry.sh
+          bash .github/scripts/test-docker-tag-expression-policy.sh
           .github/scripts/test-github-release.sh
 
       - name: Check Bash syntax
@@ -125,16 +128,10 @@ jobs:
           test "$inventory_line" -lt "$first_write_line"
           grep -Fq 'needs: [validate-inputs, build, test]' "$build"
           grep -Fq 'docker-semver-tags.sh derive' "$build"
-          grep -Fq 'inputs.tag }}^{commit}' "$build"
+          grep -Fq "git rev-parse \"\${RELEASE_TAG}^{commit}\"" "$build"
           grep -Fq 'backend/.version' "$build"
           assert_absent 'docker[[:space:]]+build|buildx|docker_build\.yml' "$repair"
-          input_tag_expression='$''{{ inputs.tag }}'
-          grep -Fqx "          RELEASE_TAG: ${input_tag_expression}" "$repair"
-          if grep -F "$input_tag_expression" "$repair" | \
-            grep -Fvx "          RELEASE_TAG: ${input_tag_expression}"; then
-            echo "inputs.tag must only be assigned to RELEASE_TAG in ${repair}" >&2
-            exit 1
-          fi
+          .github/scripts/docker-tag-expression-policy.sh "$repair"
           grep -q 'needs: \[trusted-invocation, verify-release-source\]' "$repair"
           grep -q 'reject_quarantined_release' "$stable"
           grep -q 'reject_quarantined_release' "$repair"
@@ -151,9 +148,12 @@ jobs:
             test "$decision_line" -lt "$alias_write_line"
             grep -q 'validated_common_latest_target' "$publisher"
           done
+          repair_source_preflight_line=$(grep -n 'repair_exact_source_preflight' "$repair" | head -n 1 | cut -d: -f1)
           repair_inventory_line=$(grep -n 'validated_release_inventory' "$repair" | head -n 1 | cut -d: -f1)
           repair_first_copy_line=$(grep -n 'copy_exact_by_digest' "$repair" | head -n 1 | cut -d: -f1)
+          test "$repair_source_preflight_line" -lt "$repair_inventory_line"
           test "$repair_inventory_line" -lt "$repair_first_copy_line"
+          assert_absent 'copy_exact_by_digest.*docker_exact.*gh_exact' "$repair"
           [[ $(grep -Fxc "      - '.github/scripts/test-docker-*.sh'" .github/workflows/docker_tag_validation.yml) -eq 2 ]]
           grep -q -- '--verify-tag' "$release_helper"
           grep -q -- '--latest=false' "$release_helper"
