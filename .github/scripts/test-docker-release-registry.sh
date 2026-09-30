@@ -35,20 +35,20 @@ repo_kind() {
 }
 
 alias_map() {
-  local file
+  local file fallback='{}'
   if [[ $(repo_kind "$1") == gh ]]; then
     file=${GH_ALIASES_FILE:-}
     if [[ -n $file && -r $file ]]; then
       cat "$file"
     else
-      printf '%s' "${GH_ALIASES:-'{}'}"
+      printf '%s' "${GH_ALIASES:-$fallback}"
     fi
   else
     file=${DH_ALIASES_FILE:-}
     if [[ -n $file && -r $file ]]; then
       cat "$file"
     else
-      printf '%s' "${DH_ALIASES:-'{}'}"
+      printf '%s' "${DH_ALIASES:-$fallback}"
     fi
   fi
 }
@@ -247,6 +247,10 @@ case "${command} ${subcommand}" in
         '. + {($alias): $target}' "$aliases_file" >"$temp_aliases_file"
       mv "$temp_aliases_file" "$aliases_file"
     fi
+    ;;
+  'test alias-map')
+    alias_map "$1"
+    printf '\n'
     ;;
   *)
     printf 'unexpected fake regctl call: %s %s %s\n' "$command" "$subcommand" "$*" >&2
@@ -721,6 +725,10 @@ fi
 # manifest, and only to the highest independently validated common release.
 unset GH_ALIASES_FILE DH_ALIASES_FILE FAKE_BAD_DIGEST_REF FAKE_MULTI_DIVERGENT_TAG
 unset FAKE_MISSING_VERSION_TAG
+unset GH_ALIASES DH_ALIASES
+assert_eq "$("$FAKE_REGCTL" test alias-map "$GH_REPO")" '{}'
+assert_eq "$("$FAKE_REGCTL" test alias-map "$DH_REPO")" '{}'
+
 export FAKE_VERSION_OVERRIDES='{}'
 export GH_TAGS='{"tags":["v2.16.1","v2.16.10","v2.17.2","v2.18.0"]}'
 export DH_TAGS=$GH_TAGS
@@ -916,6 +924,88 @@ assert_eq "$(validated_common_latest_target "$GH_REPO" "$DH_REPO" \
 assert_eq "$(latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" \
   v2.18.0 "$PROMOTIONS_FILE" "${repair_candidates[@]}")" \
   $'latest_eligible\ttrue\nexpected_latest_tag\tv2.18.0'
+
+unset GH_ALIASES_FILE DH_ALIASES_FILE
+
+# The main publisher must migrate legacy latest aliases before it overwrites
+# the main tag, and must leave already-stable or unrelated aliases alone.
+GH_ALIASES_FILE="$TEST_DIR/main-gh-aliases.json"
+DH_ALIASES_FILE="$TEST_DIR/main-dh-aliases.json"
+export GH_ALIASES_FILE DH_ALIASES_FILE
+printf '%s\n' '{"latest":"main","main":"main"}' >"$GH_ALIASES_FILE"
+printf '%s\n' '{"latest":"main","main":"main"}' >"$DH_ALIASES_FILE"
+: >"$WRITE_LOG"
+assert_eq "$(legacy_latest_matches_main "$GH_REPO:latest")" true
+assert_eq "$(legacy_latest_matches_main "$DH_REPO:latest")" true
+main_bootstrap_plan=$(plan_legacy_latest_bootstrap_before_main_publication \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL")
+assert_eq "$main_bootstrap_plan" \
+  "$GH_REPO:latest"$'\t'"v2.18.0"$'\n'"$DH_REPO:latest"$'\t'"v2.18.0"
+[[ ! -s $WRITE_LOG ]] || fail 'main publication bootstrap preflight wrote an alias'
+while IFS=$'\t' read -r alias_ref bootstrap_target; do
+  [[ -n $alias_ref ]] || continue
+  repository=${alias_ref%:*}
+  bootstrap_sha=$(validated_tag_source_sha "$bootstrap_target")
+  copy_alias_by_digest "$repository:$bootstrap_target" "$alias_ref"
+  verify_alias "$alias_ref" "$repository:$bootstrap_target" \
+    "$bootstrap_target" "$bootstrap_sha" "$SOURCE_URL"
+done <<<"$main_bootstrap_plan"
+for repository in "$GH_REPO" "$DH_REPO"; do
+  assert_eq "$(resolved_alias_target "$repository:latest" "$SOURCE_URL" \
+    "${migration_candidates[@]}")" v2.18.0
+done
+: >"$WRITE_LOG"
+
+# Legacy detection and migration planning are independent per registry.
+printf '%s\n' '{"latest":"main","main":"main"}' >"$GH_ALIASES_FILE"
+printf '%s\n' '{"latest":"v2.18.0","main":"main"}' >"$DH_ALIASES_FILE"
+assert_eq "$(legacy_latest_matches_main "$GH_REPO:latest")" true
+assert_eq "$(legacy_latest_matches_main "$DH_REPO:latest")" false
+assert_eq "$(plan_legacy_latest_bootstrap_before_main_publication \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL")" \
+  "$GH_REPO:latest"$'\t'"v2.18.0"
+
+printf '%s\n' '{"latest":"v2.18.0","main":"main"}' >"$GH_ALIASES_FILE"
+printf '%s\n' '{"latest":"main","main":"main"}' >"$DH_ALIASES_FILE"
+assert_eq "$(legacy_latest_matches_main "$GH_REPO:latest")" false
+assert_eq "$(legacy_latest_matches_main "$DH_REPO:latest")" true
+assert_eq "$(plan_legacy_latest_bootstrap_before_main_publication \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL")" \
+  "$DH_REPO:latest"$'\t'"v2.18.0"
+[[ ! -s $WRITE_LOG ]] || fail 'per-registry migration planning wrote an alias'
+
+# After the old main digest is displaced, the latest alias is already stable
+# and no second migration is queued.
+printf '%s\n' '{"latest":"main","main":"main"}' >"$GH_ALIASES_FILE"
+printf '%s\n' '{"latest":"main","main":"main"}' >"$DH_ALIASES_FILE"
+jq '. + {"main":"new-main"}' "$GH_ALIASES_FILE" >"$GH_ALIASES_FILE.tmp"
+mv "$GH_ALIASES_FILE.tmp" "$GH_ALIASES_FILE"
+jq '. + {"main":"new-main"}' "$DH_ALIASES_FILE" >"$DH_ALIASES_FILE.tmp"
+mv "$DH_ALIASES_FILE.tmp" "$DH_ALIASES_FILE"
+[[ $(registry_digest "$GH_REPO:latest") != $(registry_digest "$GH_REPO:main") ]] || \
+  fail 'main publication fixture did not displace the legacy main digest'
+assert_eq "$(plan_legacy_latest_bootstrap_before_main_publication \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL")" ''
+
+# An unmatched nonstable latest that does not match main is not queued for migration.
+jq '. + {"latest":"orphan","main":"main"}' "$GH_ALIASES_FILE" >"$GH_ALIASES_FILE.tmp"
+mv "$GH_ALIASES_FILE.tmp" "$GH_ALIASES_FILE"
+export FAKE_VERSION_OVERRIDES='{"orphan":"main"}'
+assert_eq "$(legacy_latest_matches_main "$GH_REPO:latest")" false
+assert_eq "$(plan_legacy_latest_bootstrap_before_main_publication \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL")" ''
+export FAKE_VERSION_OVERRIDES='{}'
+
+# A proven legacy alias without any common exact release blocks main publication.
+jq '. + {"latest":"main","main":"main"}' "$GH_ALIASES_FILE" >"$GH_ALIASES_FILE.tmp"
+mv "$GH_ALIASES_FILE.tmp" "$GH_ALIASES_FILE"
+export GH_TAGS='{"tags":[]}'; export DH_TAGS='{"tags":[]}';
+: >"$WRITE_LOG"
+if plan_legacy_latest_bootstrap_before_main_publication \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" >/dev/null 2>&1; then
+  fail 'main publication plan accepted legacy latest without a common exact release'
+fi
+[[ ! -s $WRITE_LOG ]] || fail 'missing common target caused an alias write'
 
 unset GH_ALIASES_FILE DH_ALIASES_FILE
 printf 'All Docker release registry helper tests passed.\n'

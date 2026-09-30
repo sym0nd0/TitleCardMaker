@@ -331,6 +331,25 @@ jobs:
           source .github/scripts/docker-release-registry.sh
           validated_release_inventory "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" >/dev/null
 
+      - name: Bootstrap legacy latest before main publication
+        if: ${{ inputs.channel == 'main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker-release-registry.sh
+          bootstrap_file=$(mktemp)
+          trap 'rm -f "$bootstrap_file"' EXIT
+          plan_legacy_latest_bootstrap_before_main_publication \
+            "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" >"$bootstrap_file"
+          while IFS=$'\t' read -r alias_ref bootstrap_target; do
+            [[ -n $alias_ref ]] || continue
+            repository=${alias_ref%:*}
+            bootstrap_sha=$(validated_tag_source_sha "$bootstrap_target")
+            copy_alias_by_digest "${repository}:${bootstrap_target}" "$alias_ref"
+            verify_alias "$alias_ref" "${repository}:${bootstrap_target}" \
+              "$bootstrap_target" "$bootstrap_sha" "$SOURCE_URL"
+          done <"$bootstrap_file"
+
       - name: Push architecture images
         shell: bash
         run: |

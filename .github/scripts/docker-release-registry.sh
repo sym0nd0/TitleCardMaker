@@ -395,6 +395,72 @@ registry_digest() {
   printf '%s\n' "$digest"
 }
 
+alias_version_label() {
+  (($# == 1)) || return 64
+  local alias_ref=$1 repository index_json platform_digest config_json
+  repository=$(repository_from_ref "$alias_ref") || return 1
+  if ! index_json=$($REGCTL_BIN manifest get "$alias_ref" --format raw-body 2>&1); then
+    registry_error "could not read existing alias ${alias_ref}: ${index_json}"
+    return 1
+  fi
+  platform_digest=$(jq -er '
+    [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and
+      ((.platform.variant // "") == "")) | .digest] |
+    if length == 1 then .[0] else error("ambiguous amd64 platform") end |
+    select(type == "string" and startswith("sha256:"))
+  ' <<<"$index_json") || registry_error "could not identify the version of ${alias_ref}" || return 1
+  if ! config_json=$($REGCTL_BIN image config "${repository}@${platform_digest}" --format raw-body 2>&1); then
+    registry_error "could not read existing alias config ${alias_ref}: ${config_json}"
+    return 1
+  fi
+  if ! jq -e '
+      type == "object" and
+      (.config | type == "object") and
+      ((.config.Labels == null) or (.config.Labels | type == "object"))
+    ' >/dev/null 2>&1 <<<"$config_json"; then
+    registry_error "malformed config for existing alias $alias_ref"
+    return 1
+  fi
+  if ! jq -e '
+      (.config.Labels["org.opencontainers.image.version"]? == null) or
+      (.config.Labels["org.opencontainers.image.version"]? | type == "string")
+    ' >/dev/null 2>&1 <<<"$config_json"; then
+    registry_error "$alias_ref has a malformed version label"
+    return 1
+  fi
+  jq -r '.config.Labels["org.opencontainers.image.version"]? // empty' <<<"$config_json"
+}
+
+legacy_latest_matches_main() {
+  (($# == 1)) || return 64
+  local alias_ref=$1 repository alias_state old_version main_ref main_state alias_digest main_digest
+  [[ ${alias_ref##*:} == latest ]] || registry_error "${alias_ref} is not a latest alias" || return 1
+  alias_state=$(registry_tag_state "$alias_ref") || return 1
+  if [[ $alias_state == absent ]]; then
+    printf 'false\n'
+    return 0
+  fi
+  old_version=$(alias_version_label "$alias_ref") || return 1
+  if [[ $old_version =~ $REGISTRY_STABLE_RE ]]; then
+    printf 'false\n'
+    return 0
+  fi
+  repository=$(repository_from_ref "$alias_ref") || return 1
+  main_ref="${repository}:main"
+  main_state=$(registry_tag_state "$main_ref") || return 1
+  if [[ $main_state == absent ]]; then
+    printf 'false\n'
+    return 0
+  fi
+  alias_digest=$(registry_digest "$alias_ref") || return 1
+  main_digest=$(registry_digest "$main_ref") || return 1
+  if [[ $alias_digest == "$main_digest" ]]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
 resolved_alias_target() {
   (($# >= 3)) || return 64
   local alias_ref=$1 expected_source=$2
@@ -479,7 +545,7 @@ repair_alias_bootstrap_target() {
   local alias_ref=$1 target=$2 gh_repository=$3 docker_repository=$4 expected_source=$5
   shift 5
   local alias=${alias_ref##*:} major minor candidate found=false status
-  local repository index_json platform_digest config_json old_version old_revision target_revision comparison
+  local repository old_version old_revision target_revision comparison
   local main_ref main_state alias_digest main_digest highest_common
   [[ $target =~ $REGISTRY_STABLE_RE ]] || registry_error "invalid bootstrap target ${target}" || return 1
   major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
@@ -514,37 +580,7 @@ repair_alias_bootstrap_target() {
   # Stable labels remain ordering floors. A nonstable latest needs independent
   # proof that it is the known legacy main alias before it can be replaced.
   repository=$(repository_from_ref "$alias_ref") || return 1
-  if ! index_json=$($REGCTL_BIN manifest get "$alias_ref" --format raw-body 2>&1); then
-    registry_error "could not read existing alias ${alias_ref}: ${index_json}"
-    return 1
-  fi
-  platform_digest=$(jq -er '
-    [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64" and
-      ((.platform.variant // "") == "")) | .digest] |
-    if length == 1 then .[0] else error("ambiguous amd64 platform") end |
-    select(type == "string" and startswith("sha256:"))
-  ' <<<"$index_json") || registry_error "could not identify the version of ${alias_ref}" || return 1
-  if ! config_json=$($REGCTL_BIN image config "${repository}@${platform_digest}" --format raw-body 2>&1); then
-    registry_error "could not read existing alias config ${alias_ref}: ${config_json}"
-    return 1
-  fi
-  if ! jq -e '
-      type == "object" and
-      (.config | type == "object") and
-      ((.config.Labels == null) or (.config.Labels | type == "object"))
-    ' >/dev/null 2>&1 <<<"$config_json"; then
-    registry_error "malformed config for existing alias $alias_ref"
-    return 1
-  fi
-  if ! jq -e '
-      (.config.Labels["org.opencontainers.image.version"]? == null) or
-      (.config.Labels["org.opencontainers.image.version"]? | type == "string")
-    ' >/dev/null 2>&1 <<<"$config_json"; then
-    registry_error "$alias_ref has a malformed version label"
-    return 1
-  fi
-  old_version=$(jq -r '.config.Labels["org.opencontainers.image.version"]? // empty' \
-    <<<"$config_json") || registry_error "could not read version label for $alias_ref" || return 1
+  old_version=$(alias_version_label "$alias_ref") || return 1
 
   if [[ $old_version =~ $REGISTRY_STABLE_RE ]]; then
     reject_quarantined_release "$old_version" || return 1
@@ -572,6 +608,37 @@ repair_alias_bootstrap_target() {
   [[ $target == "$highest_common" ]] || \
     registry_error "legacy latest migration target $target is not the highest validated common exact release $highest_common" || return 1
   printf '%s\n' "$target"
+}
+
+plan_legacy_latest_bootstrap_before_main_publication() {
+  (($# == 3)) || return 64
+  local gh_repository=$1 docker_repository=$2 expected_source=$3
+  local gh_legacy docker_legacy common_tags target repository alias_ref bootstrap_target
+  local -a common_exact_tags=()
+  gh_legacy=$(legacy_latest_matches_main "${gh_repository}:latest") || return 1
+  docker_legacy=$(legacy_latest_matches_main "${docker_repository}:latest") || return 1
+  [[ $gh_legacy == true || $gh_legacy == false ]] || registry_error 'invalid GHCR legacy latest state' || return 1
+  [[ $docker_legacy == true || $docker_legacy == false ]] || registry_error 'invalid Docker Hub legacy latest state' || return 1
+  [[ $gh_legacy == true || $docker_legacy == true ]] || return 0
+
+  common_tags=$(common_valid_exact_tags "$gh_repository" "$docker_repository" "$expected_source") || return 1
+  [[ -n $common_tags ]] || registry_error 'legacy latest matches main but no validated common exact release is available' || return 1
+  mapfile -t common_exact_tags <<<"$common_tags"
+  target=$(highest_common_validated_exact_tag "$gh_repository" "$docker_repository" "$expected_source") || return 1
+
+  for repository in "$gh_repository" "$docker_repository"; do
+    if [[ $repository == "$gh_repository" ]]; then
+      [[ $gh_legacy == true ]] || continue
+    else
+      [[ $docker_legacy == true ]] || continue
+    fi
+    alias_ref="${repository}:latest"
+    bootstrap_target=$(repair_alias_bootstrap_target "$alias_ref" "$target" \
+      "$gh_repository" "$docker_repository" "$expected_source" "${common_exact_tags[@]}") || return 1
+    [[ $bootstrap_target == "$target" ]] || \
+      registry_error "${alias_ref} changed before its legacy migration plan was complete" || return 1
+    printf '%s\t%s\n' "$alias_ref" "$bootstrap_target"
+  done
 }
 
 validated_common_latest_target() {
@@ -644,7 +711,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   function_name=$1
   shift
   case "$function_name" in
-    registry_tag_state|stable_exact_preflight|release_fingerprint|verify_release|compare_releases|common_valid_exact_tags|highest_common_validated_exact_tag|repair_latest_bootstrap_required|promotion_candidates|guard_alias_promotion|validated_common_latest_target|latest_decision|reject_quarantined_release|copy_exact_by_digest|copy_alias_by_digest|verify_alias)
+    registry_tag_state|stable_exact_preflight|release_fingerprint|verify_release|compare_releases|common_valid_exact_tags|highest_common_validated_exact_tag|repair_latest_bootstrap_required|promotion_candidates|guard_alias_promotion|alias_version_label|legacy_latest_matches_main|repair_alias_bootstrap_target|plan_legacy_latest_bootstrap_before_main_publication|validated_common_latest_target|latest_decision|reject_quarantined_release|copy_exact_by_digest|copy_alias_by_digest|verify_alias)
       "$function_name" "$@"
       ;;
     *)

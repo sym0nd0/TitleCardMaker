@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: titlecardmaker-docker-main
-  cancel-in-progress: true
+  group: titlecardmaker-docker-stable
+  queue: max
 
 jobs:
   docker-main:

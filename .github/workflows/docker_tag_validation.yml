@@ -123,9 +123,16 @@ jobs:
           inventory_line=$(grep -n 'name: Validate existing stable release inventory' "$build" | cut -d: -f1)
           first_write_line=$(grep -n 'name: Push architecture images' "$build" | cut -d: -f1)
           validate_source_line=$(grep -n 'name: Validate source and publication mode' "$build" | cut -d: -f1)
+          main_bootstrap_line=$(grep -n 'name: Bootstrap legacy latest before main publication' "$build" | cut -d: -f1)
+          first_main_write_line=$(grep -n 'name: Push architecture images' "$build" | cut -d: -f1)
           test "$validate_source_line" -lt "$preflight_line"
           test "$preflight_line" -lt "$inventory_line"
           test "$inventory_line" -lt "$first_write_line"
+          test "$main_bootstrap_line" -lt "$first_main_write_line"
+          grep -Fq "inputs.channel == 'main'" "$build"
+          grep -q 'group: titlecardmaker-docker-stable' "$main"
+          grep -q 'queue: max' "$main"
+          grep -q 'automatically before' "$repair"
           grep -Fq 'needs: [validate-inputs, build, test]' "$build"
           grep -Fq 'docker-semver-tags.sh derive' "$build"
           grep -Fq "git rev-parse \"\${RELEASE_TAG}^{commit}\"" "$build"
@@ -141,7 +148,8 @@ jobs:
             promotion_line=$(grep -n 'promotion_candidates' "$publisher" | head -n 1 | cut -d: -f1)
             guard_line=$(grep -n 'guard_alias_promotion' "$publisher" | head -n 1 | cut -d: -f1)
             decision_line=$(grep -n 'latest_decision' "$publisher" | head -n 1 | cut -d: -f1)
-            alias_write_line=$(grep -n 'copy_alias_by_digest' "$publisher" | head -n 1 | cut -d: -f1)
+            alias_write_line=$(grep -n 'copy_alias_by_digest' "$publisher" \
+              | awk -F: -v after="$promotion_line" '$1 > after {print $1; exit}')
             test "$exact_copy_line" -lt "$promotion_line"
             test "$promotion_line" -lt "$alias_write_line"
             test "$guard_line" -lt "$alias_write_line"

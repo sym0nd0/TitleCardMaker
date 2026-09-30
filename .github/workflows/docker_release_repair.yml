@@ -5,9 +5,10 @@ on:
     inputs:
       tag:
         description: >-
-          Existing stable release tag (vMAJOR.MINOR.PATCH). For the one-time
-          legacy latest/main migration, use the highest validated exact
-          release common to both registries before the next stable publication.
+          Existing stable release tag (vMAJOR.MINOR.PATCH). If manually
+          repairing legacy latest, use the highest validated exact release
+          common to both registries. The main publisher performs this migration
+          automatically before its first post-merge main publication.
         required: true
         type: string
 
