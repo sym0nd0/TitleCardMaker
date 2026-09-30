@@ -1,57 +1,55 @@
-name: Docker Semver Release
+name: Docker SemVer Release
 
-# Build and publish Docker images when a vMAJOR.MINOR.PATCH tag is pushed.
-# Also creates a GitHub Release for the tag.
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Existing semver tag to rebuild (e.g. v2.16.2)'
-        required: true
-        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: titlecardmaker-docker-stable
+  queue: max
 
 jobs:
-  verify:
+  verify-source:
     runs-on: ubuntu-24.04
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.source.outputs.tag }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout pushed tag commit
+        uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
 
-      - name: Resolve release tag
-        id: tag
+      - name: Verify stable tag, commit and version
+        id: source
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Using tag ${TAG}"
-
-      - name: Verify .version matches tag
-        run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          FILE_VERSION=$(tr -d '[:space:]' < backend/.version)
-          if [ "$FILE_VERSION" != "$TAG" ]; then
-            echo "backend/.version is '${FILE_VERSION}' but tag is '${TAG}'"
-            exit 1
-          fi
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          test "$GITHUB_REF" = "refs/tags/${tag}"
+          .github/scripts/docker-semver-tags.sh derive "$tag" >/dev/null
+          source .github/scripts/docker-release-registry.sh
+          reject_quarantined_release "$tag"
+          source_sha=$(git rev-parse "${tag}^{commit}")
+          test "$source_sha" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$source_sha"
+          test "$(tr -d '[:space:]' < backend/.version)" = "$tag"
+          echo "tag=${tag}" >>"$GITHUB_OUTPUT"
+          echo "source_sha=${source_sha}" >>"$GITHUB_OUTPUT"
 
   docker-release:
-    needs: verify
+    needs: verify-source
     uses: ./.github/workflows/docker_build.yml
     with:
-      tag: ${{ needs.verify.outputs.tag }}
-      addl_tag: latest
-      is_develop: false
-      publish_semver_aliases: true
+      tag: ${{ needs.verify-source.outputs.tag }}
+      source_sha: ${{ needs.verify-source.outputs.source_sha }}
+      channel: stable
     secrets:
       CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
       DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -59,22 +57,31 @@ jobs:
       GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
   github-release:
-    needs: [verify, docker-release]
+    needs: [verify-source, docker-release]
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout immutable release source
+        uses: actions/checkout@v7
         with:
-          ref: ${{ needs.verify.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.verify-source.outputs.source_sha }}
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.verify.outputs.tag }}
-          name: ${{ needs.verify.outputs.tag }}
-          generate_release_notes: true
-          make_latest: true
+      - name: Reconcile GitHub Release and explicit Latest state
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-source.outputs.tag }}
+          SOURCE_SHA: ${{ needs.verify-source.outputs.source_sha }}
+          LATEST_ELIGIBLE: ${{ needs.docker-release.outputs.latest_eligible }}
+          EXPECTED_LATEST_TAG: ${{ needs.docker-release.outputs.expected_latest_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          .github/scripts/github-release.sh reconcile \
+            "$GITHUB_REPOSITORY" \
+            "$RELEASE_TAG" \
+            "$SOURCE_SHA" \
+            "$LATEST_ELIGIBLE" \
+            "$EXPECTED_LATEST_TAG"

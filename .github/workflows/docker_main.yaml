@@ -1,17 +1,24 @@
 name: Docker Main Release
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: titlecardmaker-docker-stable
+  queue: max
 
 jobs:
   docker-main:
     uses: ./.github/workflows/docker_build.yml
     with:
-      tag: latest
-      addl_tag: main
+      tag: main
+      source_sha: ${{ github.sha }}
+      channel: main
     secrets:
       CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
       DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}

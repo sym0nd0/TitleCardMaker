@@ -1,21 +1,24 @@
-name: multi-build-docker
+name: Multi-platform Docker build
+
 on:
   workflow_call:
     inputs:
       tag:
         required: true
         type: string
-      addl_tag:
-        required: false
+      source_sha:
+        required: true
         type: string
-      is_develop:
-        required: false
-        type: boolean
-        default: false
-      publish_semver_aliases:
-        required: false
-        type: boolean
-        default: false
+      channel:
+        required: true
+        type: string
+    outputs:
+      latest_eligible:
+        description: Whether this stable release is the highest verified stable version
+        value: ${{ jobs.publish.outputs.latest_eligible }}
+      expected_latest_tag:
+        description: Verified stable exact tag selected by both Docker latest aliases
+        value: ${{ jobs.publish.outputs.expected_latest_tag }}
     secrets:
       CYPRESS_RECORD_KEY:
         required: true
@@ -26,33 +29,80 @@ on:
       GH_TOKEN:
         required: true
 
+permissions:
+  contents: read
+
 env:
   DOCKER_IMGNAME: ghcr.io/titlecardmaker/titlecardmaker
 
 jobs:
+  validate-inputs:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout immutable source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Validate source and publication mode
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          PUBLICATION_CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          case "$PUBLICATION_CHANNEL" in
+            stable)
+              .github/scripts/docker-semver-tags.sh derive "$RELEASE_TAG" >/dev/null
+              test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$SOURCE_SHA"
+              test "$(tr -d '[:space:]' < backend/.version)" = "$RELEASE_TAG"
+              ;;
+            main)
+              test "$RELEASE_TAG" = main
+              ;;
+            develop)
+              test "$RELEASE_TAG" = develop
+              ;;
+            *)
+              echo "Unsupported publication channel: ${PUBLICATION_CHANNEL}" >&2
+              exit 1
+              ;;
+          esac
+
   build:
+    needs: validate-inputs
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        arch:
-          - linux/amd64
-          # - linux/arm/v7
-          - linux/arm64
-
-    # Set dockerfile to .armv7 if arch is arm/v7
+        arch: [linux/amd64, linux/arm64]
     env:
-      DOCKERFILE: ${{ matrix.arch == 'linux/arm/v7' && 'Dockerfile.armv7' || 'Dockerfile' }}
+      DOCKERFILE: Dockerfile
       IMAGE_NAME: ''
-
     steps:
-      # Pre-setup
-      - name: Set IMAGE_NAME
-        run: echo "IMAGE_NAME=$(echo ${{ matrix.arch }} | cut -b 7- | tr -d '/')" >> $GITHUB_ENV
+      - name: Set architecture image name
+        shell: bash
+        env:
+          ARCHITECTURE: ${{ matrix.arch }}
+        run: |
+          image_name=$(cut -b 7- <<< "$ARCHITECTURE" | tr -d '/')
+          echo "IMAGE_NAME=${image_name}" >>"$GITHUB_ENV"
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout immutable source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
 
-      # Set up Docker build environment
+      - name: Verify checkout SHA
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
       - name: Set up QEMU for ARM emulation
         uses: docker/setup-qemu-action@v3
         with:
@@ -61,13 +111,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: python3 build cache for docker
-        uses: actions/cache@v4
+      - name: Cache Python build inputs
+        uses: actions/cache@v6
         with:
           path: python-build-cache
-          key: ${{ matrix.arch }}-python-build-cache
+          key: ${{ matrix.arch }}-python-build-cache-${{ inputs.source_sha }}
+          restore-keys: |
+            ${{ matrix.arch }}-python-build-cache-
 
-      - name: inject python-build-cache into docker
+      - name: Inject Python build cache
         uses: reproducible-containers/buildkit-cache-dance@v3
         with:
           cache-map: |
@@ -76,90 +128,100 @@ jobs:
             }
 
       - name: Cache Docker layers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/.buildx-cache
-          key: ${{ matrix.arch }}-buildx-${{ github.sha }}
+          key: ${{ matrix.arch }}-buildx-${{ inputs.source_sha }}
           restore-keys: |
             ${{ matrix.arch }}-buildx-
 
-      # Build container
-      - name: Build Container
+      - name: Build container
         uses: docker/build-push-action@v5
         with:
+          context: .
           file: ${{ env.DOCKERFILE }}
           platforms: ${{ matrix.arch }}
           push: false
           tags: ${{ env.DOCKER_IMGNAME }}:${{ inputs.tag }}-${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ inputs.source_sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: |
-            TCM_IS_DEVELOP=${{ inputs.is_develop == true && 'TRUE' || 'FALSE' }}
+            TCM_IS_DEVELOP=${{ inputs.channel == 'develop' && 'TRUE' || 'FALSE' }}
           outputs: type=docker,dest=/tmp/${{ env.IMAGE_NAME }}.tar
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
 
-      - # Build cache temp fix
-        # https://github.com/docker/build-push-action/issues/252
-        # https://github.com/moby/buildkit/issues/1896
-        name: Move cache
+      - name: Move build cache
+        shell: bash
         run: |
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
-      # Upload artifacts for later steps
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.IMAGE_NAME }}-image
           path: /tmp/${{ env.IMAGE_NAME }}.tar
           retention-days: 1
 
   test:
-    runs-on: ubuntu-24.04
     needs: build
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: tests
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout immutable source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify checkout SHA
+        working-directory: .
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      # Set up Cypress test environment
-      - name: Install Cypress Dependencies
+      - name: Install Cypress dependencies
         run: >
           sudo apt-get update &&
           sudo apt-get install -y --no-install-recommends
           libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev
           libnss3 libxss1 libasound2t64 libxtst6 xauth xvfb
 
-      - name: Download amd64-image
-        uses: actions/download-artifact@v4
+      - name: Download amd64 image
+        uses: actions/download-artifact@v8
         with:
           name: amd64-image
           path: /tmp
 
       - name: Load image
-        run: |
-          docker load --input /tmp/amd64.tar
-          docker image ls -a
+        run: docker load --input /tmp/amd64.tar
 
-      - name: Launch Container
+      - name: Launch container
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           mkdir config
-          docker run -itd -p 4242:4242 -e TCM_TESTING=TRUE -v "./config":"/config" "${{ env.DOCKER_IMGNAME }}:${{ inputs.tag }}-amd64"
+          docker run -itd -p 4242:4242 -e TCM_TESTING=TRUE \
+            -v "./config:/config" \
+            "$DOCKER_IMGNAME:${RELEASE_TAG}-amd64"
 
-      - name: Start virtual display (Xvfb)
-        run: |
-          Xvfb :99 -screen 0 1920x1080x24 &
+      - name: Start virtual display
+        run: Xvfb :99 -screen 0 1920x1080x24 &
 
-      - name: Run Cypress Tests
+      - name: Run Cypress tests
         run: |
           npm install
           npm run cy:run:report
@@ -167,54 +229,60 @@ jobs:
           DISPLAY: :99
           CYPRESS_RECORD_KEY: ${{ secrets.CYPRESS_RECORD_KEY }}
 
-      # Parse testing pass percentage
-      - name: Parse Test Results
+      - name: Parse test results
         id: pass-percentage
         run: |
           npx mochawesome-merge ./cypress/results/*.json > ./cypress/results/output.json
-          echo $(jq '.stats.passPercent' './cypress/results/output.json')
-          echo "PASS_PERCENTAGE=$(jq '.stats.passPercent' './cypress/results/output.json')" >> $GITHUB_OUTPUT
+          echo "PASS_PERCENTAGE=$(jq '.stats.passPercent' ./cypress/results/output.json)" >>"$GITHUB_OUTPUT"
 
-      # Upload test artifacts
-      - name: Upload Test Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v7
         with:
           name: cypress-screenshots
           path: tests/cypress/screenshots/
           retention-days: 1
 
-      - name: Error if not enough tests passed
+      - name: Require sufficient passing tests
         if: ${{ fromJSON(steps.pass-percentage.outputs.PASS_PERCENTAGE) <= 80 }}
         run: exit 1
 
-  push:
+  publish:
+    needs: [validate-inputs, build, test]
     runs-on: ubuntu-24.04
-    needs: [build, test]
+    outputs:
+      latest_eligible: ${{ steps.stable-publication.outputs.latest_eligible }}
+      expected_latest_tag: ${{ steps.stable-publication.outputs.expected_latest_tag }}
     env:
       DOCKER_HUB_IMGNAME: ${{ secrets.DOCKER_HUB_USERNAME }}/titlecardmaker
+      SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
     steps:
-      - name: Download images
-        uses: actions/download-artifact@v4
+      - name: Checkout immutable source and trusted helpers
+        uses: actions/checkout@v7
         with:
-          pattern: "*-image"
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Verify checkout SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '*-image'
           merge-multiple: true
           path: /tmp
 
-      - name: Docker image tag updates
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_IMGNAME }}
-          tags: |
-            ${{ inputs.tag }}
-
-      - name: Load docker images
+      - name: Load images
+        shell: bash
         run: |
           docker load --input /tmp/amd64.tar
           docker load --input /tmp/arm64.tar
-          docker image ls -a
 
-      - name: Login to Dockerhub
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -227,69 +295,150 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GH_TOKEN }}
 
-      # Push images to add to manifest
-      # Do not pull from these tags, use the generic label - e.g. "latest" and
-      # allow Docker to grab the correct architecture. These are build artifacts
-      - name: Push imported images
-        run: |
-          docker push ${{ steps.meta.outputs.tags }}-amd64
-          docker push ${{ steps.meta.outputs.tags }}-arm64
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.5.0
 
-      # Create mutli-arch manifest https://docs.docker.com/reference/cli/docker/manifest/
-      - name: Create manifest list and push
-        run: |
-          docker manifest create ${{ steps.meta.outputs.tags }} \
-          ${{ steps.meta.outputs.tags }}-amd64 \
-          ${{ steps.meta.outputs.tags }}-arm64
-          docker manifest push ${{ steps.meta.outputs.tags }}
-
-      # Publish the multi-arch image (and optional aliases) to Docker Hub and GHCR
-      - uses: sigstore/cosign-installer@v3.5.0
-        if: ${{ inputs.addl_tag || inputs.publish_semver_aliases }}
       - name: Install regctl
         uses: iarekylew00t/regctl-installer@61b6298c354562a692195ea71441e58508e667b0
-      - name: regctl login
-        run: |
-          regctl registry login ghcr.io -u ${{ github.repository_owner }} -p ${{ secrets.GH_TOKEN }}
-          echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | \
-            regctl registry login -u ${{ secrets.DOCKER_HUB_USERNAME }} --pass-stdin
-      - name: Publish to Docker Hub
-        run: |
-          regctl image copy ${{ steps.meta.outputs.tags }} \
-            ${{ env.DOCKER_HUB_IMGNAME }}:${{ inputs.tag }}
-      - name: regctl copy to new tag
-        if: ${{ inputs.addl_tag }}
-        run: |
-          regctl image copy ${{ steps.meta.outputs.tags }} \
-            ${{ env.DOCKER_IMGNAME }}:${{ inputs.addl_tag }}
-          regctl image copy ${{ steps.meta.outputs.tags }} \
-            ${{ env.DOCKER_HUB_IMGNAME }}:${{ inputs.addl_tag }}
 
-      # Also publish vMAJOR.MINOR and vMAJOR aliases for semver releases
-      - name: Publish semver alias tags
-        if: ${{ inputs.publish_semver_aliases }}
+      - name: Authenticate regctl
+        env:
+          GHCR_TOKEN: ${{ secrets.GH_TOKEN }}
+          DOCKER_HUB_ACCESS_TOKEN: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+        shell: bash
         run: |
-          TAG="${{ inputs.tag }}"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag '$TAG' is not vMAJOR.MINOR.PATCH; skipping aliases"
-            exit 0
-          fi
-          MAJOR_MINOR="${TAG%.*}"
-          MAJOR="${TAG%%.*}"
-          for dest in \
-            "${{ env.DOCKER_IMGNAME }}:${MAJOR_MINOR}" \
-            "${{ env.DOCKER_IMGNAME }}:${MAJOR}" \
-            "${{ env.DOCKER_HUB_IMGNAME }}:${MAJOR_MINOR}" \
-            "${{ env.DOCKER_HUB_IMGNAME }}:${MAJOR}"
-          do
-            regctl image copy "${{ steps.meta.outputs.tags }}" "${dest}"
-          done
+          printf '%s' "$GHCR_TOKEN" | \
+            regctl registry login ghcr.io -u "$GITHUB_REPOSITORY_OWNER" --pass-stdin
+          printf '%s' "$DOCKER_HUB_ACCESS_TOKEN" | \
+            regctl registry login -u "$DOCKER_HUB_USERNAME" --pass-stdin
 
-      # Delete untagged images
-      - name: Delete untagged images
+      - name: Exact-tag immutability preflight
+        if: ${{ inputs.channel == 'stable' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker-release-registry.sh
+          stable_exact_preflight \
+            "${DOCKER_IMGNAME}:${RELEASE_TAG}" \
+            "${DOCKER_HUB_IMGNAME}:${RELEASE_TAG}"
+
+      - name: Validate existing stable release inventory
+        if: ${{ inputs.channel == 'stable' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker-release-registry.sh
+          validated_release_inventory "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" >/dev/null
+
+      - name: Bootstrap legacy latest before main publication
+        if: ${{ inputs.channel == 'main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker-release-registry.sh
+          bootstrap_file=$(mktemp)
+          trap 'rm -f "$bootstrap_file"' EXIT
+          plan_legacy_latest_bootstrap_before_main_publication \
+            "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" >"$bootstrap_file"
+          while IFS=$'\t' read -r alias_ref bootstrap_target; do
+            [[ -n $alias_ref ]] || continue
+            repository=${alias_ref%:*}
+            bootstrap_sha=$(validated_tag_source_sha "$bootstrap_target")
+            copy_alias_by_digest "${repository}:${bootstrap_target}" "$alias_ref"
+            verify_alias "$alias_ref" "${repository}:${bootstrap_target}" \
+              "$bootstrap_target" "$bootstrap_sha" "$SOURCE_URL"
+          done <"$bootstrap_file"
+
+      - name: Push architecture images
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These are staging references for the immutable multi-platform exact
+          # tag. The exact-tag preflight above is the release authority.
+          docker push "${DOCKER_IMGNAME}:${RELEASE_TAG}-amd64"
+          docker push "${DOCKER_IMGNAME}:${RELEASE_TAG}-arm64"
+
+      - name: Publish exact GHCR multi-platform image
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact="${DOCKER_IMGNAME}:${RELEASE_TAG}"
+          docker manifest create "$exact" "${exact}-amd64" "${exact}-arm64"
+          docker manifest push "$exact"
+
+      - name: Publish and verify channel
+        if: ${{ inputs.channel != 'stable' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker-release-registry.sh
+          gh_exact="${DOCKER_IMGNAME}:${RELEASE_TAG}"
+          docker_exact="${DOCKER_HUB_IMGNAME}:${RELEASE_TAG}"
+          verify_release "$gh_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          copy_exact_by_digest "$gh_exact" "$docker_exact"
+          verify_release "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          compare_releases "$gh_exact" "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
+
+      - name: Publish and verify stable release and eligible aliases
+        id: stable-publication
+        if: ${{ inputs.channel == 'stable' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/docker-release-registry.sh
+          gh_exact="${DOCKER_IMGNAME}:${RELEASE_TAG}"
+          docker_exact="${DOCKER_HUB_IMGNAME}:${RELEASE_TAG}"
+          verify_release "$gh_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          copy_exact_by_digest "$gh_exact" "$docker_exact"
+          verify_release "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          compare_releases "$gh_exact" "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
+
+          candidate_file=$(mktemp)
+          promotions_file=$(mktemp)
+          decision_file=$(mktemp)
+          trap 'rm -f "$candidate_file" "$promotions_file" "$decision_file"' EXIT
+          promotion_candidates "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \
+            "$RELEASE_TAG" >"$candidate_file"
+          mapfile -t candidate_tags <"$candidate_file"
+          .github/scripts/docker-semver-tags.sh promotions \
+            "$RELEASE_TAG" "${candidate_tags[@]}" >"$promotions_file"
+          # Check both existing alias targets before copying any alias.
+          while IFS=$'\t' read -r record alias; do
+            [[ $record == promote ]] || continue
+            guard_alias_promotion "${DOCKER_IMGNAME}:${alias}" \
+              "$RELEASE_TAG" "$SOURCE_URL" "${candidate_tags[@]}"
+            guard_alias_promotion "${DOCKER_HUB_IMGNAME}:${alias}" \
+              "$RELEASE_TAG" "$SOURCE_URL" "${candidate_tags[@]}"
+          done <"$promotions_file"
+          latest_decision "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \
+            "$RELEASE_TAG" "$promotions_file" "${candidate_tags[@]}" >"$decision_file"
+          latest_eligible=$(awk -F '\t' '$1 == "latest_eligible" {print $2}' "$decision_file")
+          expected_latest_tag=$(awk -F '\t' '$1 == "expected_latest_tag" {print $2}' "$decision_file")
+          [[ $latest_eligible == true || $latest_eligible == false ]]
+          test -n "$expected_latest_tag"
+          while IFS=$'\t' read -r record alias; do
+            [[ $record == promote ]] || continue
+            copy_alias_by_digest "$gh_exact" "${DOCKER_IMGNAME}:${alias}"
+            copy_alias_by_digest "$docker_exact" "${DOCKER_HUB_IMGNAME}:${alias}"
+            verify_alias "${DOCKER_IMGNAME}:${alias}" "$gh_exact" \
+              "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
+            verify_alias "${DOCKER_HUB_IMGNAME}:${alias}" "$docker_exact" \
+              "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
+          done <"$promotions_file"
+          actual_latest_tag=$(validated_common_latest_target \
+            "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" "${candidate_tags[@]}")
+          test "$actual_latest_tag" = "$expected_latest_tag"
+          verify_release "$gh_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          verify_release "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL" >/dev/null
+          compare_releases "$gh_exact" "$docker_exact" "$RELEASE_TAG" "$SOURCE_SHA" "$SOURCE_URL"
+          echo "latest_eligible=${latest_eligible}" >>"$GITHUB_OUTPUT"
+          echo "expected_latest_tag=${expected_latest_tag}" >>"$GITHUB_OUTPUT"
+
+      - name: Delete untagged GHCR images
         uses: Chizkiyahu/delete-untagged-ghcr-action@v3
         with:
           token: ${{ secrets.GH_TOKEN }}
           untagged_only: true
-          except_untagged_multiplatform: false
+          except_untagged_multiplatform: true
           owner_type: org
