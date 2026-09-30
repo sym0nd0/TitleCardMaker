@@ -34,6 +34,25 @@ repo_kind() {
   [[ $1 == ghcr.io/* ]] && printf gh || printf dh
 }
 
+alias_map() {
+  local file
+  if [[ $(repo_kind "$1") == gh ]]; then
+    file=${GH_ALIASES_FILE:-}
+    if [[ -n $file && -r $file ]]; then
+      cat "$file"
+    else
+      printf '%s' "${GH_ALIASES:-'{}'}"
+    fi
+  else
+    file=${DH_ALIASES_FILE:-}
+    if [[ -n $file && -r $file ]]; then
+      cat "$file"
+    else
+      printf '%s' "${DH_ALIASES:-'{}'}"
+    fi
+  fi
+}
+
 index_digest() {
   if [[ ${FAKE_MULTI_RELEASE:-0} == 1 ]]; then
     printf 'sha256:%s' "$(printf '%s:%s' "$(repo_kind "$1")" "$(tag_from_ref "$1")" | sha256sum | cut -d' ' -f1)"
@@ -50,10 +69,11 @@ state_for() {
   if [[ ${FAKE_MULTI_RELEASE:-0} == 1 ]]; then
     local tag=${1##*:} tags aliases target
     if [[ $(repo_kind "$1") == gh ]]; then
-      tags=${GH_TAGS:-'{"tags":[]}'} aliases=${GH_ALIASES:-'{}'}
+      tags=${GH_TAGS:-'{"tags":[]}'}
     else
-      tags=${DH_TAGS:-'{"tags":[]}'} aliases=${DH_ALIASES:-'{}'}
+      tags=${DH_TAGS:-'{"tags":[]}'}
     fi
+    aliases=$(alias_map "$1")
     if [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       if jq -e --arg tag "$tag" '.tags | index($tag) != null' >/dev/null <<<"$tags"; then
         printf present
@@ -83,11 +103,7 @@ tag_from_ref() {
   local ref=${1%%@*}
   local tag=${ref##*:} aliases target
   if [[ ${FAKE_MULTI_RELEASE:-0} == 1 && ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    if [[ $(repo_kind "$1") == gh ]]; then
-      aliases=${GH_ALIASES:-'{}'}
-    else
-      aliases=${DH_ALIASES:-'{}'}
-    fi
+    aliases=$(alias_map "$1")
     target=$(jq -r --arg tag "$tag" '.[$tag] // empty' <<<"$aliases")
     [[ -z $target ]] || tag=$target
   fi
@@ -111,14 +127,22 @@ case "${command} ${subcommand}" in
     esac
     ;;
   'image digest')
-    index_digest "$1"
-    printf '\n'
+    if [[ ${FAKE_BAD_DIGEST_REF:-} == "$1" ]]; then
+      printf '%s\n' "${FAKE_BAD_DIGEST_VALUE:-malformed-digest}"
+    else
+      index_digest "$1"
+      printf '\n'
+    fi
     ;;
   'manifest get')
     ref=$1
     if [[ ${FAKE_MULTI_RELEASE:-0} == 1 && $ref == *@sha256:amd-* ]]; then
       tag=${ref##*amd-}
-      printf '{"schemaVersion":2,"config":{"digest":"sha256:config-amd-%s"},"layers":[{"digest":"sha256:layer-amd-%s"}]}\n' "$tag" "$tag"
+      layer=layer-amd-$tag
+      if [[ ${FAKE_MULTI_DIVERGENT_TAG:-} == "$tag" && $(repo_kind "$ref") == dh ]]; then
+        layer=divergent-amd-$tag
+      fi
+      printf '{"schemaVersion":2,"config":{"digest":"sha256:config-amd-%s"},"layers":[{"digest":"sha256:%s"}]}\n' "$tag" "$layer"
     elif [[ ${FAKE_MULTI_RELEASE:-0} == 1 && $ref == *@sha256:arm-* ]]; then
       tag=${ref##*arm-}
       printf '{"schemaVersion":2,"config":{"digest":"sha256:config-arm-%s"},"layers":[{"digest":"sha256:layer-arm-%s"}]}\n' "$tag" "$tag"
@@ -158,12 +182,21 @@ case "${command} ${subcommand}" in
     ref=$1
     if [[ ${FAKE_MULTI_RELEASE:-0} == 1 ]]; then
       tag=${ref##*-}
-      version=$tag revision=$(printf '%s' "$tag" | sha1sum | cut -d' ' -f1)
+      version=$tag
+      if [[ -n ${FAKE_VERSION_OVERRIDES:-} ]]; then
+        version=$(jq -r --arg tag "$tag" '.[$tag] // $tag' <<<"$FAKE_VERSION_OVERRIDES")
+      fi
+      revision=$(printf '%s' "$tag" | sha1sum | cut -d' ' -f1)
     else
       tag=${RELEASE_TAG:-$(tag_from_ref "$ref")}
       version=$tag revision=${SOURCE_SHA:-1111111111111111111111111111111111111111}
     fi
     source=${SOURCE_URL:-https://github.com/TitleCardMaker/TitleCardMaker}
+    if [[ ${FAKE_MISSING_VERSION_TAG:-} == "$tag" ]]; then
+      printf '{"config":{"Labels":{"org.opencontainers.image.revision":"%s","org.opencontainers.image.source":"%s"}}}\n' \
+        "$revision" "$source"
+      exit 0
+    fi
     case ${FAKE_MODE:-valid} in
       wrong_version) version=v9.9.9 ;;
       wrong_revision) revision=2222222222222222222222222222222222222222 ;;
@@ -182,6 +215,38 @@ case "${command} ${subcommand}" in
     ;;
   'image copy')
     printf '%s -> %s\n' "$1" "$2" >>"$WRITE_LOG"
+    source_repo=${1%@*}
+    source_digest=${1##*@}
+    destination_repo=${2%:*}
+    destination_tag=${2##*:}
+    if [[ $(repo_kind "$destination_repo") == gh ]]; then
+      aliases_file=${GH_ALIASES_FILE:-}
+    else
+      aliases_file=${DH_ALIASES_FILE:-}
+    fi
+    if [[ -n $aliases_file ]]; then
+      if [[ $(repo_kind "$source_repo") == gh ]]; then
+        source_tags=${GH_TAGS:-'{"tags":[]}'}
+      else
+        source_tags=${DH_TAGS:-'{"tags":[]}'}
+      fi
+      source_tag=''
+      while IFS= read -r candidate; do
+        [[ -n $candidate ]] || continue
+        if [[ $(index_digest "${source_repo}:${candidate}") == "$source_digest" ]]; then
+          source_tag=$candidate
+          break
+        fi
+      done < <(jq -r '.tags[]? // empty' <<<"$source_tags")
+      [[ -n $source_tag ]] || {
+        printf 'stateful fake copy could not identify source digest %s\n' "$source_digest" >&2
+        exit 91
+      }
+      temp_aliases_file=${aliases_file}.tmp
+      jq --arg alias "$destination_tag" --arg target "$source_tag" \
+        '. + {($alias): $target}' "$aliases_file" >"$temp_aliases_file"
+      mv "$temp_aliases_file" "$aliases_file"
+    fi
     ;;
   *)
     printf 'unexpected fake regctl call: %s %s %s\n' "$command" "$subcommand" "$*" >&2
@@ -652,4 +717,205 @@ if repair_alias_bootstrap_target "$GH_REPO:v2.16" v2.16.10 "$GH_REPO" "$DH_REPO"
 fi
 [[ ! -s $WRITE_LOG ]] || fail 'failed bootstrap preflight caused a write'
 
+# Legacy latest may migrate only from the registry's own current main
+# manifest, and only to the highest independently validated common release.
+unset GH_ALIASES_FILE DH_ALIASES_FILE FAKE_BAD_DIGEST_REF FAKE_MULTI_DIVERGENT_TAG
+unset FAKE_MISSING_VERSION_TAG
+export FAKE_VERSION_OVERRIDES='{}'
+export GH_TAGS='{"tags":["v2.16.1","v2.16.10","v2.17.2","v2.18.0"]}'
+export DH_TAGS=$GH_TAGS
+export GH_ALIASES='{"latest":"main","main":"main"}'
+export DH_ALIASES=$GH_ALIASES
+mapfile -t migration_candidates < <(promotion_candidates "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10)
+assert_eq "$(registry_digest "$GH_REPO:latest")" "$(registry_digest "$GH_REPO:main")"
+assert_eq "$(registry_digest "$DH_REPO:latest")" "$(registry_digest "$DH_REPO:main")"
+assert_eq "$(highest_common_validated_exact_tag "$GH_REPO" "$DH_REPO" "$SOURCE_URL")" v2.18.0
+export DH_TAGS='{"tags":[]}'
+if highest_common_validated_exact_tag "$GH_REPO" "$DH_REPO" "$SOURCE_URL" >/dev/null 2>&1; then
+  fail 'highest common release selection accepted an empty common set'
+fi
+export DH_TAGS=$GH_TAGS
+: >"$WRITE_LOG"
+assert_eq "$(repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}")" v2.18.0
+assert_eq "$(repair_alias_bootstrap_target "$DH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}")" v2.18.0
+[[ ! -s $WRITE_LOG ]] || fail 'legacy latest preflight wrote an alias'
+
+export FAKE_MISSING_VERSION_TAG=main
+for repository in "$GH_REPO" "$DH_REPO"; do
+  assert_eq "$(repair_alias_bootstrap_target "$repository:latest" v2.18.0 \
+    "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}")" v2.18.0
+done
+unset FAKE_MISSING_VERSION_TAG
+
+export GH_ALIASES='{"latest":"orphan","main":"main"}'
+export DH_ALIASES=$GH_ALIASES
+export FAKE_VERSION_OVERRIDES='{"orphan":"main"}'
+orphan_latest_digest=$(registry_digest "$GH_REPO:latest")
+main_alias_digest=$(registry_digest "$GH_REPO:main")
+[[ $orphan_latest_digest != "$main_alias_digest" ]] || \
+  fail 'arbitrary latest fixture unexpectedly matched main'
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'a nonstable latest with a main label but a different digest was accepted'
+fi
+
+export FAKE_VERSION_OVERRIDES='{}'
+export GH_ALIASES='{"latest":"main"}'
+export DH_ALIASES=$GH_ALIASES
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted a missing main alias'
+fi
+
+export GH_ALIASES='{"latest":"main","main":"__malformed__"}'
+export DH_ALIASES=$GH_ALIASES
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted a malformed main lookup'
+fi
+
+export GH_ALIASES='{"latest":"main","main":"main"}'
+export DH_ALIASES=$GH_ALIASES
+export FAKE_BAD_DIGEST_REF="$GH_REPO:main"
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted a malformed main digest'
+fi
+unset FAKE_BAD_DIGEST_REF
+
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.17.2 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted a target below the highest common release'
+fi
+
+export DH_TAGS='{"tags":["v2.16.1","v2.16.10","v2.17.2"]}'
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted a target missing from Docker Hub'
+fi
+export DH_TAGS=$GH_TAGS
+export GH_TAGS='{"tags":["v2.16.1","v2.16.10","v2.17.2"]}'
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted a target missing from GHCR'
+fi
+export GH_TAGS='{"tags":["v2.16.1","v2.16.10","v2.17.2","v2.18.0"]}'
+
+export FAKE_MULTI_DIVERGENT_TAG=v2.18.0
+if repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'legacy latest migration accepted divergent cross-registry target content'
+fi
+unset FAKE_MULTI_DIVERGENT_TAG
+[[ ! -s $WRITE_LOG ]] || fail 'a rejected legacy latest preflight wrote an alias'
+
+export GH_ALIASES='{"latest":"main","main":"main","v2":"main","v2.16":"main"}'
+export DH_ALIASES=$GH_ALIASES
+for alias in v2 v2.16; do
+  if repair_alias_bootstrap_target "$GH_REPO:$alias" v2.18.0 \
+    "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+    fail 'legacy latest exception accepted nonstable series alias'
+  fi
+done
+
+export GH_ALIASES='{"latest":"main","main":"main"}'
+if guard_alias_promotion "$GH_REPO:latest" v2.18.0 "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'normal publication accepted the legacy unmatched latest alias'
+fi
+
+# Stable latest aliases continue through the existing exact-release and
+# ordering-floor checks, including the no-backwards-promotion guard.
+export GH_ALIASES='{"latest":"v2.16.10"}'
+assert_eq "$(repair_alias_bootstrap_target "$GH_REPO:latest" v2.18.0 \
+  "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${migration_candidates[@]}")" ''
+guard_alias_promotion "$GH_REPO:latest" v2.18.0 "$SOURCE_URL" "${migration_candidates[@]}"
+export GH_ALIASES='{"latest":"v2.18.0"}'
+if guard_alias_promotion "$GH_REPO:latest" v2.17.2 "$SOURCE_URL" "${migration_candidates[@]}" >/dev/null 2>&1; then
+  fail 'stable latest ordering floor allowed backwards movement'
+fi
+
+# Run both repair decision branches with stateful fake registries. The
+# simulated image copies update alias state only after the full preflight.
+GH_ALIASES_FILE="$TEST_DIR/gh-aliases.json"
+DH_ALIASES_FILE="$TEST_DIR/dh-aliases.json"
+BOOTSTRAP_FILE="$TEST_DIR/bootstrap-plan"
+PROMOTIONS_FILE="$TEST_DIR/repair-promotions"
+export GH_ALIASES_FILE DH_ALIASES_FILE
+printf '%s\n' '{"latest":"main","main":"main"}' >"$GH_ALIASES_FILE"
+printf '%s\n' '{"latest":"main","main":"main"}' >"$DH_ALIASES_FILE"
+: >"$BOOTSTRAP_FILE"
+: >"$WRITE_LOG"
+assert_eq "$(repair_latest_bootstrap_required "$BOOTSTRAP_FILE")" false
+promotion_text=$(promotion_candidates "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.16.10)
+mapfile -t repair_candidates <<<"$promotion_text"
+"$SCRIPT_DIR/docker-semver-tags.sh" promotions v2.16.10 "${repair_candidates[@]}" >"$PROMOTIONS_FILE"
+if grep -Fqx $'promote\tlatest' "$PROMOTIONS_FILE"; then
+  fail 'older repair tag unexpectedly selected latest for direct promotion'
+fi
+highest_common=$(highest_common_validated_exact_tag "$GH_REPO" "$DH_REPO" "$SOURCE_URL")
+for repository in "$GH_REPO" "$DH_REPO"; do
+  alias_ref="$repository:latest"
+  bootstrap_target=$(repair_alias_bootstrap_target "$alias_ref" "$highest_common" \
+    "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${repair_candidates[@]}")
+  if [[ -n $bootstrap_target ]]; then
+    printf '%s\t%s\n' "$alias_ref" "$bootstrap_target" >>"$BOOTSTRAP_FILE"
+  fi
+done
+latest_repair_required=$(repair_latest_bootstrap_required "$BOOTSTRAP_FILE")
+assert_eq "$latest_repair_required" true
+if [[ $latest_repair_required == false ]]; then
+  latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" \
+    v2.16.10 "$PROMOTIONS_FILE" "${repair_candidates[@]}" >/dev/null
+fi
+if latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" \
+  v2.16.10 "$PROMOTIONS_FILE" "${repair_candidates[@]}" >/dev/null 2>&1; then
+  fail 'prewrite latest decision accepted the legacy aliases before bootstrap copies'
+fi
+[[ ! -s $WRITE_LOG ]] || fail 'repair bootstrap planning wrote a registry alias'
+while IFS=$'\t' read -r alias_ref bootstrap_target; do
+  [[ -n $alias_ref ]] || continue
+  repository=${alias_ref%:*}
+  copy_alias_by_digest "$repository:$bootstrap_target" "$alias_ref"
+done <"$BOOTSTRAP_FILE"
+assert_eq "$(validated_common_latest_target "$GH_REPO" "$DH_REPO" \
+  "$SOURCE_URL" "${repair_candidates[@]}")" v2.18.0
+assert_eq "$(latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" \
+  v2.16.10 "$PROMOTIONS_FILE" "${repair_candidates[@]}")" \
+  $'latest_eligible\tfalse\nexpected_latest_tag\tv2.18.0'
+grep -F " -> $GH_REPO:latest" "$WRITE_LOG" >/dev/null || fail 'repair did not copy GHCR latest'
+grep -F " -> $DH_REPO:latest" "$WRITE_LOG" >/dev/null || fail 'repair did not copy Docker Hub latest'
+
+printf '%s\n' '{"latest":"main","main":"main"}' >"$GH_ALIASES_FILE"
+printf '%s\n' '{"latest":"main","main":"main"}' >"$DH_ALIASES_FILE"
+: >"$BOOTSTRAP_FILE"
+: >"$WRITE_LOG"
+promotion_text=$(promotion_candidates "$GH_REPO" "$DH_REPO" "$SOURCE_URL" v2.18.0)
+mapfile -t repair_candidates <<<"$promotion_text"
+"$SCRIPT_DIR/docker-semver-tags.sh" promotions v2.18.0 "${repair_candidates[@]}" >"$PROMOTIONS_FILE"
+grep -Fqx $'promote\tlatest' "$PROMOTIONS_FILE" || fail 'highest repair tag did not select latest'
+for repository in "$GH_REPO" "$DH_REPO"; do
+  alias_ref="$repository:latest"
+  bootstrap_target=$(repair_alias_bootstrap_target "$alias_ref" v2.18.0 \
+    "$GH_REPO" "$DH_REPO" "$SOURCE_URL" "${repair_candidates[@]}")
+  [[ $bootstrap_target == v2.18.0 ]] || fail 'highest-tag legacy bootstrap selected the wrong target'
+  printf '%s\t%s\n' "$alias_ref" "$bootstrap_target" >>"$BOOTSTRAP_FILE"
+done
+latest_repair_required=$(repair_latest_bootstrap_required "$BOOTSTRAP_FILE")
+assert_eq "$latest_repair_required" true
+assert_eq "$(latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" \
+  v2.18.0 "$PROMOTIONS_FILE" "${repair_candidates[@]}")" \
+  $'latest_eligible\ttrue\nexpected_latest_tag\tv2.18.0'
+while IFS=$'\t' read -r alias_ref bootstrap_target; do
+  [[ -n $alias_ref ]] || continue
+  repository=${alias_ref%:*}
+  copy_alias_by_digest "$repository:$bootstrap_target" "$alias_ref"
+done <"$BOOTSTRAP_FILE"
+assert_eq "$(validated_common_latest_target "$GH_REPO" "$DH_REPO" \
+  "$SOURCE_URL" "${repair_candidates[@]}")" v2.18.0
+assert_eq "$(latest_decision "$GH_REPO" "$DH_REPO" "$SOURCE_URL" \
+  v2.18.0 "$PROMOTIONS_FILE" "${repair_candidates[@]}")" \
+  $'latest_eligible\ttrue\nexpected_latest_tag\tv2.18.0'
+
+unset GH_ALIASES_FILE DH_ALIASES_FILE
 printf 'All Docker release registry helper tests passed.\n'

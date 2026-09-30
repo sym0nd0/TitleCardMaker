@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing stable tag to repair (vMAJOR.MINOR.PATCH)
+        description: >-
+          Existing stable release tag (vMAJOR.MINOR.PATCH). For the one-time
+          legacy latest/main migration, use the highest validated exact
+          release common to both registries before the next stable publication.
         required: true
         type: string
 
@@ -212,30 +215,16 @@ jobs:
             done
           done <"$promotions_file"
 
-          latest_repair_required=false
           if ! grep -Fqx $'promote\tlatest' "$promotions_file"; then
             # A repair of an older tag also reconciles latest to the highest
             # common validated exact tag.
-            common_tags=$(common_valid_exact_tags "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL")
-            highest_common=''
-            while IFS= read -r candidate; do
-              [[ -n $candidate ]] || continue
-              if [[ -z $highest_common ]]; then
-                highest_common=$candidate
-              else
-                comparison=$(.github/scripts/docker-semver-tags.sh compare "$candidate" "$highest_common")
-                [[ $comparison == 1 || $comparison == 0 || $comparison == -1 ]]
-                [[ $comparison != 1 ]] || highest_common=$candidate
-              fi
-            done <<<"$common_tags"
-            test -n "$highest_common"
+            highest_common=$(highest_common_validated_exact_tag "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL")
             for repository in "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME"; do
               alias_ref="${repository}:latest"
               bootstrap_target=$(repair_alias_bootstrap_target "$alias_ref" "$highest_common" \
                 "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" "${candidate_tags[@]}")
               if [[ -n $bootstrap_target ]]; then
                 printf '%s\t%s\n' "$alias_ref" "$bootstrap_target" >>"$bootstrap_file"
-                latest_repair_required=true
               else
                 known_latest=$(resolved_alias_target "$alias_ref" "$SOURCE_URL" "${candidate_tags[@]}")
                 if [[ $known_latest != "$highest_common" ]]; then
@@ -243,11 +232,11 @@ jobs:
                   # The normal guard still rejects any known newer target.
                   guard_alias_promotion "$alias_ref" "$highest_common" "$SOURCE_URL" "${candidate_tags[@]}"
                   printf '%s\t%s\n' "$alias_ref" "$highest_common" >>"$bootstrap_file"
-                  latest_repair_required=true
                 fi
               fi
             done
           fi
+          latest_repair_required=$(repair_latest_bootstrap_required "$bootstrap_file")
           if [[ $latest_repair_required == false ]]; then
             # Fail closed before bootstrap copies. The later call recomputes the output.
             latest_decision "$DOCKER_IMGNAME" "$DOCKER_HUB_IMGNAME" "$SOURCE_URL" \

@@ -334,6 +334,34 @@ common_valid_exact_tags() {
   return 0
 }
 
+highest_common_validated_exact_tag() {
+  (($# == 3)) || return 64
+  local common_tags selection highest
+  local -a exact_tags=()
+  common_tags=$(common_valid_exact_tags "$@") || return 1
+  [[ -n $common_tags ]] || registry_error 'no validated common exact release is available for alias migration' || return 1
+  mapfile -t exact_tags <<<"$common_tags"
+  ((${#exact_tags[@]} > 0)) || registry_error 'no validated common exact release is available for alias migration' || return 1
+  selection=$("${BASH_SOURCE[0]%/*}/docker-semver-tags.sh" promotions \
+    "${exact_tags[0]}" "${exact_tags[@]}") || return 1
+  highest=$(awk -F '\t' '$1 == "expected_latest" {print $2}' <<<"$selection")
+  [[ $highest =~ $REGISTRY_STABLE_RE ]] || registry_error 'could not select the highest validated common exact release' || return 1
+  printf '%s\n' "$highest"
+}
+
+repair_latest_bootstrap_required() {
+  (($# == 1)) || return 64
+  local bootstrap_file=$1 status
+  [[ -r $bootstrap_file ]] || registry_error "cannot read bootstrap plan ${bootstrap_file}" || return 1
+  if awk -F '\t' '$1 ~ /:latest$/ {found=1} END {exit !found}' "$bootstrap_file"; then
+    printf 'true\n'
+  else
+    status=$?
+    [[ $status == 1 ]] || registry_error "could not inspect bootstrap plan ${bootstrap_file}" || return 1
+    printf 'false\n'
+  fi
+}
+
 promotion_candidates() {
   (($# == 4)) || return 64
   local current=$4 inventory location tag current_common=false
@@ -452,6 +480,7 @@ repair_alias_bootstrap_target() {
   shift 5
   local alias=${alias_ref##*:} major minor candidate found=false status
   local repository index_json platform_digest config_json old_version old_revision target_revision comparison
+  local main_ref main_state alias_digest main_digest highest_common
   [[ $target =~ $REGISTRY_STABLE_RE ]] || registry_error "invalid bootstrap target ${target}" || return 1
   major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
   reject_quarantined_release "$target" || return 1
@@ -482,8 +511,8 @@ repair_alias_bootstrap_target() {
     [[ $status == 2 ]] || return "$status"
   fi
 
-  # Read the current alias's claimed version only to forbid a backwards move.
-  # A missing Git tag, bad label, platform, or provenance stops migration.
+  # Stable labels remain ordering floors. A nonstable latest needs independent
+  # proof that it is the known legacy main alias before it can be replaced.
   repository=$(repository_from_ref "$alias_ref") || return 1
   if ! index_json=$($REGCTL_BIN manifest get "$alias_ref" --format raw-body 2>&1); then
     registry_error "could not read existing alias ${alias_ref}: ${index_json}"
@@ -499,19 +528,49 @@ repair_alias_bootstrap_target() {
     registry_error "could not read existing alias config ${alias_ref}: ${config_json}"
     return 1
   fi
-  old_version=$(jq -er '.config.Labels["org.opencontainers.image.version"] | select(type == "string")' \
-    <<<"$config_json") || registry_error "${alias_ref} has no usable version label" || return 1
-  [[ $old_version =~ $REGISTRY_STABLE_RE ]] || registry_error "${alias_ref} has invalid version ${old_version}" || return 1
-  reject_quarantined_release "$old_version" || return 1
-  case $alias in
-    "v${major}.${minor}") [[ $old_version =~ ^v${major}\.${minor}\.[0-9]+$ ]] ;;
-    "v${major}") [[ $old_version =~ ^v${major}\.[0-9]+\.[0-9]+$ ]] ;;
-    latest) true ;;
-  esac || registry_error "${alias_ref} points outside its release series" || return 1
-  old_revision=$(validated_tag_source_sha "$old_version") || return 1
-  verify_release "$alias_ref" "$old_version" "$old_revision" "$expected_source" >/dev/null || return 1
-  comparison=$("${BASH_SOURCE[0]%/*}/docker-semver-tags.sh" compare "$target" "$old_version") || return 1
-  [[ $comparison == 1 ]] || registry_error "${alias_ref} is not older than ${target}" || return 1
+  if ! jq -e '
+      type == "object" and
+      (.config | type == "object") and
+      ((.config.Labels == null) or (.config.Labels | type == "object"))
+    ' >/dev/null 2>&1 <<<"$config_json"; then
+    registry_error "malformed config for existing alias $alias_ref"
+    return 1
+  fi
+  if ! jq -e '
+      (.config.Labels["org.opencontainers.image.version"]? == null) or
+      (.config.Labels["org.opencontainers.image.version"]? | type == "string")
+    ' >/dev/null 2>&1 <<<"$config_json"; then
+    registry_error "$alias_ref has a malformed version label"
+    return 1
+  fi
+  old_version=$(jq -r '.config.Labels["org.opencontainers.image.version"]? // empty' \
+    <<<"$config_json") || registry_error "could not read version label for $alias_ref" || return 1
+
+  if [[ $old_version =~ $REGISTRY_STABLE_RE ]]; then
+    reject_quarantined_release "$old_version" || return 1
+    case $alias in
+      "v$major.$minor") [[ $old_version =~ ^v$major\.$minor\.[0-9]+$ ]] ;;
+      "v$major") [[ $old_version =~ ^v$major\.[0-9]+\.[0-9]+$ ]] ;;
+      latest) true ;;
+    esac || registry_error "$alias_ref points outside its release series" || return 1
+    old_revision=$(validated_tag_source_sha "$old_version") || return 1
+    verify_release "$alias_ref" "$old_version" "$old_revision" "$expected_source" >/dev/null || return 1
+    comparison=$("${BASH_SOURCE[0]%/*}/docker-semver-tags.sh" compare "$target" "$old_version") || return 1
+    [[ $comparison == 1 ]] || registry_error "$alias_ref is not older than $target" || return 1
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  [[ $alias == latest ]] || registry_error "$alias_ref has invalid version $old_version" || return 1
+  main_ref="$repository:main"
+  main_state=$(registry_tag_state "$main_ref") || return 1
+  [[ $main_state == present ]] || registry_error "$main_ref is missing; refusing legacy latest migration" || return 1
+  alias_digest=$(registry_digest "$alias_ref") || return 1
+  main_digest=$(registry_digest "$main_ref") || return 1
+  [[ $alias_digest == "$main_digest" ]] || registry_error "$alias_ref does not match the current main digest" || return 1
+  highest_common=$(highest_common_validated_exact_tag "$gh_repository" "$docker_repository" "$expected_source") || return 1
+  [[ $target == "$highest_common" ]] || \
+    registry_error "legacy latest migration target $target is not the highest validated common exact release $highest_common" || return 1
   printf '%s\n' "$target"
 }
 
@@ -585,7 +644,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   function_name=$1
   shift
   case "$function_name" in
-    registry_tag_state|stable_exact_preflight|release_fingerprint|verify_release|compare_releases|common_valid_exact_tags|promotion_candidates|guard_alias_promotion|validated_common_latest_target|latest_decision|reject_quarantined_release|copy_exact_by_digest|copy_alias_by_digest|verify_alias)
+    registry_tag_state|stable_exact_preflight|release_fingerprint|verify_release|compare_releases|common_valid_exact_tags|highest_common_validated_exact_tag|repair_latest_bootstrap_required|promotion_candidates|guard_alias_promotion|validated_common_latest_target|latest_decision|reject_quarantined_release|copy_exact_by_digest|copy_alias_by_digest|verify_alias)
       "$function_name" "$@"
       ;;
     *)
